@@ -1,0 +1,8 @@
+{
+  "bos_token": "<|bos|>",
+  "eos_token": "",
+  "unk_token": "",
+  "pad_token": "",
+  "model_max_length": 512,
+  "tokenizer_class": "GPT2BPETokenizer"
+}
