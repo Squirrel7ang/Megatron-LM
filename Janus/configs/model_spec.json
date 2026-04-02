@@ -1,0 +1,48 @@
+{
+  "model_metadata": {
+    "name": "FM9G",
+    "framework": "Megatron-LM",
+    "pretrain_path": "/home/test/Megatron-LM/pretrain_fm9g.py",
+    "model_type": "decoder-only"
+  },
+  "decoder": {
+    "architecture": {
+      "num_layers": 16,
+      "hidden_size": 3584,
+      "ffn_hidden_size": 18944,
+      "num_attention_heads": 28,
+      "num_query_groups": 4,
+      "vocab_size": 73448,
+      "max_position_embeddings": 32768,
+      "seq_length": 4096,
+      "untie_embeddings_and_output_weights": true
+    },
+    "operator_features": {
+      "activation_func": "swiglu",
+      "position_embedding_type": "rotary",
+      "bias_linear": false,
+      "attention_backend": "flash",
+      "use_flash_attn": true,
+      "normalization": "rmsnorm"
+    }
+  },
+  "training_hyperparams": {
+    "precision": "bf16",
+    "distributed_backend": "nccl",
+    "num_layers_per_virtual_pipeline_stage": 4,
+    "data_path": "data/wikitext-2/wikitext2_text_document_text_document",
+    "tokenizer_type": "SentencePieceTokenizer",
+    "tokenizer_model": "jiuge/tokenizer/tokenizer.model",
+    "learning_rate": 1e-4,
+    "lr_decay_style": "cosine",
+    "lr_warmup_fraction": 0.02,
+    "train_iters": 1000,
+    "weight_decay": 0.1,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "adam_eps": 1e-6,
+    "use_distributed_optimizer": true,
+    "log_interval": 1,
+    "log_throughput": true
+  }
+}

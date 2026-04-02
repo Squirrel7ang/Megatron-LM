@@ -1,0 +1,70 @@
+{
+  "cluster_metadata": {
+    "name": "TianShu Cluster",
+    "total_nodes": 1,
+    "master_address": "10.31.10.210",
+    "master_port": 12345,
+    "network_type": "Ethernet",
+    "is_heterogeneous": false,
+    "comment": "Set to true if nodes or GPUs have different specs"
+  },
+  "hardware_library": {
+    "TianGai-150": {
+      "memory_capacity_gb": 32,
+      "theoretical_tflops": 100
+    },
+    "NVIDIA-A100-80GB": {
+      "memory_capacity_gb": 80,
+      "theoretical_tflops": 312
+    }
+  },
+  "nodes": [
+    {
+      "node_id": 0,
+      "hostname": "u210",
+      "ip": "10.31.10.210",
+      "gpus": [
+        {
+          "global_id": 0,
+          "local_id": 0,
+          "type": "TianGai-150"
+        },
+        {
+          "global_id": 1,
+          "local_id": 1,
+          "type": "TianGai-150"
+        },
+        {
+          "global_id": 2,
+          "local_id": 2,
+          "type": "TianGai-150"
+        },
+        {
+          "global_id": 3,
+          "local_id": 3,
+          "type": "TianGai-150"
+        },
+        {
+          "global_id": 4,
+          "local_id": 4,
+          "type": "TianGai-150"
+        },
+        {
+          "global_id": 5,
+          "local_id": 5,
+          "type": "TianGai-150"
+        },
+        {
+          "global_id": 6,
+          "local_id": 6,
+          "type": "TianGai-150"
+        },
+        {
+          "global_id": 7,
+          "local_id": 7,
+          "type": "TianGai-150"
+        }
+      ]
+    }
+  ]
+}
