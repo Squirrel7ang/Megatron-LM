@@ -6,12 +6,15 @@ import queue
 import traceback
 from typing import Optional, Dict, Any
 from dataclasses import asdict
+import dataclasses
+import multiprocessing as mp
+from queue import Empty
 
 from core.common.protocol import JanusMessage, ActionCode, MessageType, StatusCode
 from core.common.cluster_context import NodeInfo, CollectiveType
 from core.common.prober.env_prober import EnvProber
 from core.common.prober.compute_prober import ComputeProber
-from core.common.prober.network.probe_engine import IntraNodeProber, InterNodeProber
+from core.common.prober.network.probe_engine import ProbeEngine, IntraNodeProber, InterNodeProber
 
 
 class SlaveMessenger:
@@ -44,6 +47,12 @@ class SlaveMessenger:
         self.listener_thread: Optional[threading.Thread] = None
         self.heartbeat_thread: Optional[threading.Thread] = None
         self.worker_thread: Optional[threading.Thread] = None
+
+        # New: Worker Management
+        self.worker_processes: List[mp.Process] = []
+        self.worker_task_queues: List[mp.Queue] = []
+        self.worker_result_queue: mp.Queue = mp.get_context("spawn").Queue()
+        self.global_world_initialized = threading.Event()
 
     def connect_to_master(self):
         try:
@@ -132,15 +141,118 @@ class SlaveMessenger:
             except queue.Empty:
                 continue
 
-            if cmd.action == ActionCode.PROBE_ENV:
+            if cmd.action == ActionCode.CREATE_GROUP:
+                self._handle_create_group(cmd)
+            elif cmd.action == ActionCode.PROBE_ENV:
                 self._wrap_probe(self.env_prober.probe, cmd)
             elif cmd.action == ActionCode.PROBE_COMPUTE:
                 self._wrap_probe(self.compute_prober.probe, cmd)
             elif cmd.action == ActionCode.PROBE_NET_INTRA or cmd.action == ActionCode.PROBE_NET_INTER:
                 self._handle_probe_network(cmd)
+            elif cmd.action == ActionCode.BARRIER:
+                self._handle_barrier(cmd)
             elif cmd.action == ActionCode.TERMINATE:
                 self.close()
                 break
+
+    def _handle_create_group(self, request: JanusMessage):
+        """
+        Handles the CREATE_GROUP command by spawning persistent GPU workers
+        and initializing the global NCCL process group.
+        """
+        payload = request.payload
+        master_addr = payload["master_addr"]
+        master_port = payload["master_port"]
+        world_size = payload["world_size"]
+        backend = payload.get("backend", "nccl")
+
+        num_local_gpus = len(self.node_info.gpus)
+        ctx = mp.get_context("spawn")
+
+        print(f"[Slave {self.rank}] Initializing {num_local_gpus} persistent workers...")
+
+        try:
+            for i in range(num_local_gpus):
+                task_q = ctx.Queue()
+                self.worker_task_queues.append(task_q)
+                
+                # Get global rank for this local GPU
+                local_gpu_id = i
+                global_rank = self.cluster_context.get_global_rank(self.rank, local_gpu_id)
+
+                p = ctx.Process(
+                    target=self._persistent_worker_loop,
+                    args=(
+                        global_rank, local_gpu_id, world_size, 
+                        master_addr, master_port, backend,
+                        task_q, self.worker_result_queue
+                    ),
+                    daemon=True
+                )
+                p.start()
+                self.worker_processes.append(p)
+
+            self.global_world_initialized.set()
+            self._send_response(request, StatusCode.SUCCESS, {"msg": "Workers spawned and WORLD init started"})
+            
+        except Exception as e:
+            print(f"[Slave {self.rank}] Failed to create group: {e}")
+            self._send_response(request, StatusCode.ERROR, {"error": str(e)})
+
+    @staticmethod
+    def _persistent_worker_loop(rank, local_gpu, world_size, master_addr, master_port, 
+                                backend, task_queue, result_queue):
+        """
+        The long-running loop inside each GPU process.
+        """
+        try:
+            # 1. Initialize the global WORLD group once
+            init_method = f"tcp://{master_addr}:{master_port}"
+            dist.init_process_group(
+                backend=backend,
+                init_method=init_method,
+                rank=rank,
+                world_size=world_size
+            )
+            print(f"[Worker Rank {rank}] Global WORLD initialized.")
+
+            group_cache = {}
+
+            # 2. Continuous Task Processing
+            while True:
+                # Wait for task from Slave Messenger
+                task = task_queue.get() 
+                if task is None: break # Termination signal
+
+                action = task['action']
+                payload = task['payload']
+                
+                # 3. Sub-group Management (dist.new_group)
+                group_key = tuple(sorted(payload['global_ranks']))
+                if group_key not in group_cache:
+                    # Every worker in the WORLD must call this
+                    pg = dist.new_group(ranks=payload['global_ranks'])
+                    group_cache[group_key] = pg
+                
+                target_pg = group_cache[group_key]
+
+                # 4. Run Probing if this rank is involved
+                if rank in payload['global_ranks']:
+                    # Use existing prober logic but pass the persistent PG
+                    # Note: You'll need to adapt ProbeEngine to accept a pre-existing PG
+                    perf = ProbeEngine.run_benchmark(
+                        group=target_pg,
+                        local_gpu=local_gpu,
+                        config=payload
+                    )
+                    result_queue.put(perf)
+                else:
+                    # Participant is 'shadowing' to maintain collective consistency
+                    pass
+
+        except Exception as e:
+            print(f"[Worker Rank {rank}] Critical Error: {e}")
+            traceback.print_exc()
 
     def _wrap_probe(self, probe_func, request: JanusMessage):
         try:
@@ -157,11 +269,6 @@ class SlaveMessenger:
         Aggregates results using the 'Straggler' logic (worst-case performance)
         and returns complete task metadata (task_id, dim, etc.) to the Master.
         """
-        import dataclasses
-        import multiprocessing as mp
-        from queue import Empty
-        import traceback
-
         action_code = request.action
         payload = request.payload
         
@@ -175,7 +282,7 @@ class SlaveMessenger:
         global_ranks = payload.get("global_ranks") 
         
         # 2. Determine communication protocol (P2P for PP, All-Reduce for TP/DP)
-        communication_type = "P2P" if probe_dim == "pp" else CollectiveType.ALL_REDUCE
+        communication_type = CollectiveType.P2P if probe_dim == "pp" else CollectiveType.ALL_REDUCE
         
         # 3. Select benchmark message sizes based on the parallel dimension
         if probe_dim == "tp":
@@ -250,6 +357,7 @@ class SlaveMessenger:
                 "dim": probe_dim,
                 "strategy": strategy,
                 "group_idx": group_idx,
+                "group": global_ranks,
                 "perf": dataclasses.asdict(perf)
             }
 
@@ -292,6 +400,21 @@ class SlaveMessenger:
             
         except Exception as e:
             print(f"[Worker] Global Rank {my_global_rank} failed: {e}")
+
+    def _handle_barrier(self, request: JanusMessage):
+        """
+        Handle barrier from master
+        """
+        resp = JanusMessage(
+            source_rank=self.rank,
+            target=self.master_rank,
+            action=request.action,
+            msg_type=MessageType.RESPONSE,
+            request_id=request.request_id,
+            status=StatusCode.SUCCESS,
+            payload={"msg": "Barrier reached"}
+        )
+        self.send_to_master(resp)
 
     def _send_response(self, request: JanusMessage, status: StatusCode, payload: Dict):
         """

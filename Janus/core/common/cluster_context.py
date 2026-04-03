@@ -3,6 +3,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Dict, Optional, Tuple, Any
+import math
 
 # --- 1. Communication Primitives and Performance Models ---
 
@@ -34,24 +35,26 @@ class CommPerformance:
 class ParallelStrategyPerformance:
     """
     Holds performance data and communication group definitions for a specific
-    parallelization strategy (TP, PP, DP).
+    parallelization strategy (TP, DP, PP).
 
     Attributes:
         tp: Tensor parallelism degree.
-        pp: Pipeline parallelism degree.
         dp: Data parallelism degree.
-        communication_groups: Dictionary mapping group type ("tp", "pp", "dp")
+        pp: Pipeline parallelism degree.
+        communication_groups: Dictionary mapping group type ("tp", "dp", "pp")
                               to a list of rank lists.
         dimension_performance: tp/dp/pp -> Dict[CollectiveType, CommPerformance]
     """
     tp: int
-    pp: int
     dp: int
+    pp: int
     communication_groups: Dict[str, List[List[int]]] = field(default_factory=dict)
     dimension_performance: Dict[str, Dict[CollectiveType, CommPerformance]] = field(default_factory=dict)
+    all_case: Dict[str, Dict[Tuple[int, ...], Dict[CollectiveType, CommPerformance]]] = field(default_factory=dict)
+    the_worst_case: Dict[str, Dict[CollectiveType ,Tuple[int, ...]]] = field(default_factory=dict)
 
     def __repr__(self):
-        return f"StrategyPerf(TP={self.tp}, PP={self.pp}, DP={self.dp})"
+        return f"StrategyPerf(TP={self.tp}, DP={self.dp}, PP={self.pp})"
 
 
 # --- 2. Hardware Unit Abstractions ---
@@ -64,6 +67,8 @@ class GPUInfo:
     pci_bus_id: str              # PCI bus identifier
     type: str                    # GPU model (e.g., "A100")
     memory_capacity_gb: float
+    memory_bandwidth_gbps: float = 0.0
+    best_matmul_size: int = 0
     theoretical_tflops: float = 0.0
     peak_gemm_tflops: float = 0.0
     gemm_efficiency: float = 0.0
@@ -94,34 +99,89 @@ class ClusterContext:
     models for various parallelization strategies.
 
     This class also provides methods to generate orthogonal communication groups
-    (TP, PP, DP) following the exact logic used in Megatron-LM.
+    (TP, DP, PP) following the exact logic used in Megatron-LM.
     """
     cluster_name: str
     total_nodes: int
     master_addr: str
     master_port: int
-    gpus_per_node: int
     nodes: List[NodeInfo] = field(default_factory=list)
     env_fingerprint: str = ""
-    # Map: global_rank -> node_id
-    rank_to_node_map: Dict[int, int] = field(default_factory=dict, init=False)
-    # Map: global_rank -> local_rank (rank within the node)
-    rank_to_local_map: Dict[int, int] = field(default_factory=dict, init=False)
     strategy_matrix: Dict[Tuple[int, int, int], ParallelStrategyPerformance] = field(default_factory=dict)
 
-    def __post_init__(self):
-        """Build mappings and infer cluster properties."""
-        self._build_rank_map()
-        self._infer_gpus_per_node()
+    # ------------------------------------------------------------------
+    # Dynamic Properties (Computed on-the-fly)
+    # ------------------------------------------------------------------
 
-    def _build_rank_map(self):
-        """Constructs both global-to-node and global-to-local mappings."""
-        self.rank_to_node_map = {}
-        self.rank_to_local_map = {}
+    @property
+    def gpus_per_node(self) -> int:
+        """
+        Dynamically infers gpus_per_node from the current nodes list.
+        If nodes are not yet probed, returns 0.
+        """
+        if not self.nodes:
+            return 0
+
+        # Extract real-time GPU counts from each node
+        counts = [len(node.gpus) for node in self.nodes]
+        
+        # If no GPUs are detected in any node yet
+        if not counts or max(counts) == 0:
+            return 0
+
+        # Check homogeneity (ensure all nodes have the same number of GPUs)
+        # Assuming validate_homogeneity is a helper method in this class
+        if self.validate_homogeneity():
+            return counts[0]
+        else:
+            # For heterogeneous clusters, use the minimum as a safe baseline
+            min_count = min(counts)
+            # print(f"[Warning] Heterogeneous cluster. Baseline GPUs: {min_count}")
+            return min_count
+
+    @property
+    def min_gpu_mem_gb(self) -> float:
+        """
+        Dynamically calculates the minimum VRAM across all detected GPUs.
+        """
+        all_mems = [
+            gpu.memory_capacity_gb 
+            for node in self.nodes 
+            for gpu in node.gpus
+        ]
+        return min(all_mems) if all_mems else 0.0
+
+    @property
+    def rank_to_node_map(self) -> Dict[int, int]:
+        """
+        Dynamically builds the global_rank -> node_id mapping.
+        """
+        mapping = {}
         for node in self.nodes:
             for gpu in node.gpus:
-                self.rank_to_node_map[gpu.global_id] = node.node_id
-                self.rank_to_local_map[gpu.global_id] = gpu.local_id
+                mapping[gpu.global_id] = node.node_id
+        return mapping
+
+    @property
+    def rank_to_local_map(self) -> Dict[int, int]:
+        """
+        Dynamically builds the global_rank -> local_rank mapping.
+        """
+        mapping = {}
+        for node in self.nodes:
+            for gpu in node.gpus:
+                mapping[gpu.global_id] = gpu.local_id
+        return mapping
+
+    @property
+    def total_gpus(self) -> int:
+        """
+        Total gpus in the cluster
+        """
+        gpu_cnt = 0
+        for node in self.nodes:
+            gpu_cnt += len(node.gpus)
+        return gpu_cnt
 
     def get_global_rank(self, node_id: int, local_rank: int) -> int:
         """
@@ -146,39 +206,24 @@ class ClusterContext:
         raise ValueError(f"No global_rank found for Node {node_id} and Local Rank {local_rank}. "
                          f"Check if cluster initialization is complete.")
 
-    def _infer_gpus_per_node(self):
-        """
-        Infers gpus_per_node from the provided nodes list.
-        If the cluster is heterogeneous, this marks the property as a 'reference' 
-        value (usually the most common or the first node's count).
-        """
-        if not self.nodes:
-            self.gpus_per_node = 0
-            return
-
-        counts = [len(node.gpus) for node in self.nodes]
-        first_count = counts[0]
-        
-        is_homogeneous = self.validate_homogeneity()
-        
-        if is_homogeneous:
-            self.gpus_per_node = first_count
-        else:
-            self.gpus_per_node = min(counts) 
-            print(f"[Warning] Heterogeneous cluster detected. "
-                  f"Using min(gpus_per_node)={self.gpus_per_node} for strategy generation.")
-
     def get_strategic_samples(self, groups: List[List[int]], parallel_type: str) -> List[List[int]]:
         """
-        Two-stage Priority Sampling Algorithm:
-        1. Separates groups into Cross-node and Intra-node pools.
-        2. Prioritizes Cross-node samples (RDMA bottlenecks) using node-pair deduplication.
-        3. Fills remaining budget with Intra-node samples to capture local variance.
+        Multi-stage Priority Sampling Algorithm:
+        1. Classifies groups into Cross-node and Intra-node pools.
+        2. Prioritizes topologically unique Cross-node paths (RDMA bottlenecks).
+        3. Prioritizes topologically unique Intra-node paths (local variance).
+        4. Fallback fill: Relaxes deduplication to meet sample budget if needed.
         """
         if not groups:
             return []
 
+        # Budget: Take the smaller value between total groups and total nodes
+        max_samples = min(len(groups), len(self.nodes))
+        
         samples = []
+        # Use tuple representation of groups to track what has already been sampled
+        sampled_group_tuples = set() 
+        
         covered_node_pairs = set()   # Tracks unique node combinations (e.g., (Node0, Node1))
         covered_single_nodes = set() # Tracks unique single nodes
 
@@ -193,27 +238,36 @@ class ClusterContext:
             else:
                 intra_node_pool.append((group, involved_nodes[0]))
 
-        # Max samples capped at number of nodes to ensure efficiency
-        max_samples = len(self.nodes)
-
-        # --- Stage 2: Prioritize Cross-node Paths (The RDMA Bottleneck) ---
+        # --- Stage 2: Prioritize Unique Cross-node Paths ---
         for group, nodes in cross_node_pool:
             if nodes not in covered_node_pairs:
                 samples.append(group)
+                sampled_group_tuples.add(tuple(group))
                 covered_node_pairs.add(nodes)
             
             if len(samples) >= max_samples:
-                break
+                return samples
 
-        # --- Stage 3: Fill remaining budget with Intra-node Paths ---
-        if len(samples) < max_samples:
-            for group, node_id in intra_node_pool:
-                if node_id not in covered_single_nodes:
-                    samples.append(group)
-                    covered_single_nodes.add(node_id)
-                
-                if len(samples) >= max_samples:
-                    break
+        # --- Stage 3: Prioritize Unique Intra-node Paths ---
+        for group, node_id in intra_node_pool:
+            if node_id not in covered_single_nodes:
+                samples.append(group)
+                sampled_group_tuples.add(tuple(group))
+                covered_single_nodes.add(node_id)
+            
+            if len(samples) >= max_samples:
+                return samples
+
+        # --- Stage 4: Fallback Fill (Relax Deduplication constraints) ---
+        # Fixes the edge case where topological duplication (e.g., 8 PP groups sharing 
+        # identical node pairs across 2 nodes) leaves the sample budget unfulfilled.
+        for group in groups:
+            if tuple(group) not in sampled_group_tuples:
+                samples.append(group)
+                sampled_group_tuples.add(tuple(group))
+            
+            if len(samples) >= max_samples:
+                break
 
         return samples
 
@@ -324,15 +378,15 @@ class ClusterContext:
 
         return all_groups
 
-    def init_parallel_strategy(self, tp: int, pp: int, dp: int) -> ParallelStrategyPerformance:
+    def init_parallel_strategy(self, tp: int, dp: int, pp: int) -> ParallelStrategyPerformance:
         """
         Initializes a ParallelStrategyPerformance object, automatically generating 
         Megatron-style rank groups, and registers it in the strategy matrix.
 
         Args:
             tp: Tensor parallelism degree.
-            pp: Pipeline parallelism degree.
             dp: Data parallelism degree.
+            pp: Pipeline parallelism degree.
 
         Returns:
             The populated ParallelStrategyPerformance instance.
@@ -342,7 +396,7 @@ class ClusterContext:
             raise ValueError(f"World size {world_size} mismatch with TP({tp})*PP({pp})*DP({dp})")
 
         # Create the strategy object
-        strategy_perf = ParallelStrategyPerformance(tp=tp, pp=pp, dp=dp)
+        strategy_perf = ParallelStrategyPerformance(tp=tp, dp=dp, pp=pp)
 
         # Standard Megatron dimension order: [TP, DP, PP]
         # This order determines the stride logic: global_rank = tp + dp*TP + pp*TP*DP
@@ -355,16 +409,25 @@ class ClusterContext:
             "pp": self._generate_masked_orthogonal_rank_groups(world_size, parallel_size, [False, False, True])
         }
         
-        # Initialize the nested dict for performance metrics (empty placeholders)
         for dim in ["tp", "dp", "pp"]:
-            strategy_perf.communication_performance[dim] = {
-                tuple(group): {} for group in strategy_perf.communication_groups[dim]
+            groups = strategy_perf.communication_groups.get(dim, [])
+            
+            # 1. Initialize all_case: dim -> group_tuple -> {CollectiveType: CommPerformance}
+            strategy_perf.all_case[dim] = {
+                tuple(group): {} for group in groups
             }
+            
+            # 2. Initialize dimension_performance: dim -> {CollectiveType: CommPerformance}
+            strategy_perf.dimension_performance[dim] = {}
+            
+            # 3. Initialize the_worst_case: dim -> {CollectiveType: group_tuple}
+            strategy_perf.the_worst_case[dim] = {}
 
         # Store in matrix
-        self.strategy_matrix[(tp, pp, dp)] = strategy_perf
+        self.strategy_matrix[(tp, dp, pp)] = strategy_perf
         return strategy_perf
 
+    @staticmethod
     def _get_factors(n: int) -> List[int]:
         """Get all factors of n"""
         if n <= 0:
@@ -379,12 +442,17 @@ class ClusterContext:
     def get_plausible_strategies(
         self,
         preferred_tp: int = 4,
+        model_ctx: Optional[Any] = None,  
+        mbs: int = 1                      
     ) -> List[Tuple[int, int, int]]:
         """
         Generate robust (tp, dp, pp) strategies with realistic constraints.
+        Optionally prune invalid/OOM strategies if a ModelContext is provided.
 
         Args:
             preferred_tp: The preferred TP degree used in scoring heuristic (default=4).
+            model_ctx: Optional ModelContext instance to evaluate structural & memory feasibility.
+            mbs: Micro-batch size used for memory estimation (default=1).
 
         Returns:
             A sorted list of (tp, dp, pp) tuples representing viable parallelism strategies.
@@ -400,12 +468,10 @@ class ClusterContext:
             )
 
         total_gpus = self.total_nodes * self.gpus_per_node
-        strategies = []
+        raw_strategies = []
 
         # --- 1. TP candidates (strictly intra-node) ---
-        # Since tp divides gpus_per_node and total_gpus = nodes * gpus_per_node,
-        # tp always divides total_gpus exactly — no remainder risk below.
-        tp_candidates = _get_factors(self.gpus_per_node)
+        tp_candidates = self._get_factors(self.gpus_per_node)
 
         # --- 2. Enumerate (tp, pp, dp) combinations ---
         for tp in tp_candidates:
@@ -413,33 +479,25 @@ class ClusterContext:
             if tp == total_gpus:
                 continue
 
-            # total_gpus // tp is exact because tp | gpus_per_node | total_gpus
             remaining = total_gpus // tp
 
-            for pp in _get_factors(remaining):
+            for pp in self._get_factors(remaining):
                 dp = remaining // pp  # exact by construction
 
                 # --- 3. Hard constraints ---
-                # TP must divide node GPUs (intra-node parallelism) — already guaranteed
-                # by construction, but kept as an explicit safety assertion.
                 assert self.gpus_per_node % tp == 0, (
                     f"Invariant violated: gpus_per_node={self.gpus_per_node} not divisible by tp={tp}"
                 )
 
-                # dp >= 1 is guaranteed by construction (remaining // pp >= 1),
-                # but guard against unexpected edge cases.
                 if dp < 1:
                     continue
 
                 # --- 4. Heuristic filtering ---
-
-                # Avoid trivial strategy: pure TP only (no DP, no PP)
-                # Note: tp == total_gpus is already excluded above, so this
-                # catches the degenerate dp=1, pp=1 case properly.
+                # Avoid trivial strategy: pure TP only
                 if dp == 1 and pp == 1:
                     continue
 
-                # Avoid full PP (entire model pipelined across all GPUs)
+                # Avoid full PP
                 if pp == total_gpus:
                     continue
 
@@ -447,18 +505,38 @@ class ClusterContext:
                 if pp > self.total_nodes * 2:
                     continue
 
-                # --- 5. Topology-aware filtering ---
-                # Prefer PP aligned with node boundaries for clean pipeline layout.
+                # Prefer PP aligned with node boundaries
                 if pp > self.total_nodes and pp % self.total_nodes != 0:
                     continue
 
-                strategies.append((tp, dp, pp))
+                raw_strategies.append((tp, dp, pp))
 
-            # --- 6. Deduplicate (set handles duplicates from factor enumeration) ---
-            strategies = list(set(strategies))
+        # --- 5. Deduplicate ---
+        raw_strategies = list(set(raw_strategies))
 
-            # --- 7. Sort by heuristic score ---
-            effective_preferred_tp = min(preferred_tp, self.gpus_per_node)
+        # --- 6. Model Context Pruning (High-Fidelity) ---
+        strategies = []
+        for tp, dp, pp in raw_strategies:
+            if model_ctx is not None:
+
+                report = model_ctx.evaluate_strategy_memory(
+                    tp=tp, pp=pp, dp=dp, 
+                    mbs=mbs, 
+                    gpus_per_node=self.gpus_per_node, 
+                    gpu_mem_limit_gb=self.min_gpu_mem_gb
+                )
+                
+                # Key logic:
+                # In evaluate_strategy_memory, 'feasible' is False only if utilization > 1.0 (absolute OOM)
+                # or if dimensions are not divisible. Strategies that are tight or dangerous still have feasible=True,
+                # so they are kept.
+                if not report["feasible"]:
+                    continue  # Skip strategies that are absolutely infeasible
+                
+            strategies.append((tp, dp, pp))
+
+        # --- 7. Sort by heuristic score ---
+        effective_preferred_tp = min(preferred_tp, self.gpus_per_node)
 
         def score(x: Tuple[int, int, int]) -> Tuple[int, int, int]:
             tp, dp, pp = x
@@ -470,8 +548,11 @@ class ClusterContext:
 
         strategies.sort(key=score)
 
-        print(f"[ClusterContext] Found {len(strategies)} strategies for "
+        print(f"[ClusterContext] Found {len(strategies)} viable strategies for "
             f"{self.total_nodes} nodes x {self.gpus_per_node} GPUs = {total_gpus} total GPUs")
+        if model_ctx is not None:
+            print(f"[ClusterContext] Strategies pruned using ModelContext constraints.")
+            
         print(f"Top strategies (tp, dp, pp): {strategies[:10]}")
 
         return strategies

@@ -189,11 +189,12 @@ class ModelParser:
 
         # 02. Transformer Blocks
         for i in range(1, section.num_layers + 1):
+            block_params = section.estimate_block_params(has_cross_attn=has_cross_attn)
             block = LayerIR(
                 layer_id=current_id,
                 name=f"{prefix}_layer_{i}",
                 type="TransformerBlock",
-                params=self._estimate_block_params(section, has_cross_attn),
+                params=block_params,
                 weight_shape=[section.hidden_size, section.hidden_size],
                 sub_components=self._generate_transformer_components(section, mask_type, has_cross_attn)
             )
@@ -289,103 +290,4 @@ class ModelParser:
         ))
 
         return components
-
-    def _estimate_block_params(self, section: SectionContext, has_cross_attn: bool) -> int:
-        """Estimates block parameters strictly using section-specific dimensions."""
-        total_params = 0
-        head_dim = section.hidden_size // section.num_attention_heads
-        act_func = section.operator_features.get("activation_func", "gelu").lower()
-
-        # Self-Attn params
-        total_params += section.hidden_size * (section.num_attention_heads + 2 * section.num_query_groups) * head_dim
-        total_params += section.hidden_size * section.hidden_size
         
-        # Cross-Attn params addition
-        if has_cross_attn:
-            total_params += section.hidden_size * (section.num_attention_heads + 2 * section.num_query_groups) * head_dim
-            total_params += section.hidden_size * section.hidden_size
-            total_params += section.hidden_size # extra norm
-        
-        # MLP params
-        mlp_multiplier = 2 if act_func == "swiglu" else 1
-        total_params += section.hidden_size * (section.ffn_hidden_size * mlp_multiplier)
-        total_params += section.ffn_hidden_size * section.hidden_size
-        
-        # Norms
-        total_params += 2 * section.hidden_size
-        return total_params
-
-    def _estimate_block_flops(self, section: SectionContext, seq_len: int, has_cross_attn: bool) -> int:
-        """Estimates FLOPs for a block within a specific section."""
-        h = section.hidden_size
-        ffn_h = section.ffn_hidden_size
-        act_func = section.operator_features.get("activation_func", "gelu").lower()
-        pe_type = section.operator_features.get("position_embedding_type", "rotary").lower()
-
-        head_dim = h // section.num_attention_heads
-        qkv_out = (section.num_attention_heads + 2 * section.num_query_groups) * head_dim
-        
-        flops_qkv = seq_len * (2 * h * qkv_out)
-        flops_attn_proj = seq_len * (2 * h * h)
-        
-        mlp_mult = 2 if act_func == "swiglu" else 1
-        flops_mlp = seq_len * ((2 * h * ffn_h * mlp_mult) + (2 * ffn_h * h))
-        flops_attention_matrix = 4 * (seq_len**2) * h
-
-        total_matmul_flops = flops_qkv + flops_attn_proj + flops_mlp + flops_attention_matrix
-
-        if has_cross_attn:
-            total_matmul_flops += (flops_qkv + flops_attn_proj + flops_attention_matrix)
-
-        extra_flops = 0
-        if pe_type == "rotary":
-            extra_flops += seq_len * (12 * h)
-            
-        norms_count = 3 if has_cross_attn else 2
-        extra_flops += seq_len * (norms_count * 10 * h)
-        extra_flops += seq_len * (10 * ffn_h)
-
-        return total_matmul_flops + extra_flops
-
-    def estimate_model_total_flops(self, ctx: ModelContext) -> int:
-        """
-        Calculates FLOPs dynamically by scanning through SectionContext layers.
-        Utilizes the section-specific sequence length.
-        """
-        total_fwd_flops = 0
-        
-        for section_name, section in ctx.sections.items():
-            s_seq_len = section.seq_length
-            for layer in section.layers:
-                if layer.type == "TransformerBlock":
-                    has_cross = any("cross" in comp.role for comp in layer.sub_components)
-                    # Pass the section-specific seq_length
-                    total_fwd_flops += self._estimate_block_flops(section, s_seq_len, has_cross)
-                
-                # Dynamic LM Head check ensures we use the correct section's dims
-                elif layer.type == "Linear" and "lm_head" in layer.name:
-                    total_fwd_flops += 2 * s_seq_len * section.hidden_size * section.vocab_size
-                    
-        return int(total_fwd_flops * 3)
-
-    def estimate_model_static_memory(self, ctx: ModelContext, precision: str = "bf16") -> Dict[str, float]:
-        """
-        Leverages get_flat_topology() to seamlessly estimate static memory 
-        across the entire heterogeneous architecture.
-        """
-        bytes_per_param = 2 if precision in ["bf16", "fp16"] else 4
-        total_params = 0
-        
-        # Flattens encoder -> decoder -> backbone seamlessly
-        for layer in ctx.get_flat_topology():
-            total_params += layer.params
-            
-        weight_mem_gb = (total_params * bytes_per_param) / (1024**3)
-        opt_state_mem_gb = (total_params * 12) / (1024**3) if ctx.training_hyperparams.get("use_distributed_optimizer") else 0
-        
-        return {
-            "total_params_billions": total_params / 1e9,
-            "weight_mem_gb": weight_mem_gb,
-            "optimizer_state_mem_gb": opt_state_mem_gb,
-            "minimum_required_vram_gb": weight_mem_gb + opt_state_mem_gb
-        }

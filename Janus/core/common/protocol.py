@@ -7,14 +7,15 @@ from typing import Any, Optional, Dict, Union, List, Literal
 
 class ActionCode(IntEnum):
     HANDSHAKE = 0
-    PROBE_ALL = 1
-    PROBE_ENV = 2
-    PROBE_COMPUTE = 3
-    PROBE_NET_INTRA = 4   # L1: Local COLLECTIVE/P2P within one node
-    PROBE_NET_INTER = 5   # L2: Cross COLLECTIVE/P2P within multi nodes
-    BARRIER = 6
-    HEARTBEAT = 7
-    TERMINATE = 8
+    CREATE_GROUP = 1
+    PROBE_ALL = 2
+    PROBE_ENV = 3
+    PROBE_COMPUTE = 4
+    PROBE_NET_INTRA = 5   # L1: Local COLLECTIVE/P2P within one node
+    PROBE_NET_INTER = 6   # L2: Cross COLLECTIVE/P2P within multi nodes
+    BARRIER = 7
+    HEARTBEAT = 8
+    TERMINATE = 9
 
 class StatusCode(IntEnum):
     SUCCESS = 0

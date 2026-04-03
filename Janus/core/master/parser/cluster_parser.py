@@ -2,7 +2,7 @@ import json
 from typing import Set, List
 from core.common.cluster_context import ClusterContext, NodeInfo, GPUInfo
 
-class ModelParser:
+class ClusterParser:
     """
     Parses cluster_spec.json, references the hardware library, 
     and constructs a ClusterContext with vendor-level validation.

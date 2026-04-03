@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Set, Any
 from core.common.protocol import JanusMessage, MessageType, ActionCode, StatusCode
 from core.common.prober.env_prober import EnvProber
 from core.common.prober.compute_prober import ComputeProber
-from core.common.prober.network.intra_prober import IntraNodeProber
+from core.common.prober.network.probe_engine import IntraNodeProber
 
 
 class MasterMessenger:
@@ -34,13 +34,12 @@ class MasterMessenger:
 
     MAX_MESSAGE_SIZE = 50 * 1024 * 1024  # 50MB safety limit
 
-    def __init__(self, host: str, port: int, rank: int, expected_slaves: int, cluster: Any):
+    def __init__(self, host: str, port: int, expected_slaves: int, cluster: Any):
         self.host, self.port = host, port
         self.expected_slaves = expected_slaves
         self.cluster = cluster
 
-        # Topology & Identity Management
-        self.rank = rank                      # Master is rank 0
+        # Topology & Identity Management                  
         self.slave_conns: List[socket.socket] = []
         self.rank_to_conn: Dict[int, socket.socket] = {}
         self.conn_to_rank: Dict[socket.socket, int] = {}
@@ -162,7 +161,7 @@ class MasterMessenger:
 
                     # Send handshake ACK
                     ack = JanusMessage(
-                        source_rank=self.rank, target=rank,
+                        source_rank=-1, target=rank,
                         action=ActionCode.HANDSHAKE, msg_type=MessageType.RESPONSE,
                         request_id=msg.request_id, status=StatusCode.SUCCESS,
                         payload={"status": "ACCEPTED", "rank": rank, "world_size": self.expected_slaves}

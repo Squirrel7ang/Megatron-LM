@@ -2,6 +2,7 @@ import unittest
 import json
 import os
 import sys
+import tempfile
 
 # Ensure the core module is discoverable
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -9,6 +10,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from core.master.parser.model_parser import ModelParser
+from core.common.model_context import ModelContext
 
 class TestModelParser(unittest.TestCase):
     def setUp(self):
@@ -25,8 +27,8 @@ class TestModelParser(unittest.TestCase):
 
     def _create_config(self, name: str, model_type: str, arch_overrides: dict = None) -> str:
         """
-        Helper to generate model configuration files aligned with the FM9G structure.
-        The 'architecture' and 'operator_features' are nested under the specific model type node.
+        Helper to generate model configuration files aligned with the Janus IR structure.
+        The architecture and operator_features are nested to match FM9G's real-world JSON.
         """
         # Default FM9G-style architecture settings
         architecture = {
@@ -50,8 +52,10 @@ class TestModelParser(unittest.TestCase):
 
         # Apply specific overrides if provided
         if arch_overrides:
-            architecture.update(arch_overrides.get("architecture", {}))
-            operator_features.update(arch_overrides.get("operator_features", {}))
+            if "architecture" in arch_overrides:
+                architecture.update(arch_overrides["architecture"])
+            if "operator_features" in arch_overrides:
+                operator_features.update(arch_overrides["operator_features"])
 
         config = {
             "model_metadata": {
@@ -62,22 +66,20 @@ class TestModelParser(unittest.TestCase):
             },
             "training_hyperparams": {
                 "precision": "bf16",
-                "distributed_backend": "nccl",
-                "num_layers_per_virtual_pipeline_stage": 4,
                 "data_path": "data/wikitext-2/corpus",
                 "tokenizer_type": "SentencePieceTokenizer",
+                "tokenizer_model": "tokenizer.model",
                 "train_iters": 1000,
                 "use_distributed_optimizer": True
             }
         }
 
-        # Nesting architecture based on model type to align with user's structure
+        # Nesting architecture based on model type to align with ModelParser's logic
         if model_type == "decoder-only":
             config["decoder"] = {"architecture": architecture, "operator_features": operator_features}
         elif model_type == "encoder-only":
             config["encoder"] = {"architecture": architecture, "operator_features": operator_features}
         elif model_type == "encoder-decoder":
-            # For T5-style, we apply the same to both for testing simplicity
             config["encoder"] = {"architecture": architecture, "operator_features": operator_features}
             config["decoder"] = {"architecture": architecture, "operator_features": operator_features}
 
@@ -88,24 +90,24 @@ class TestModelParser(unittest.TestCase):
 
     def test_fm9g_parameter_count(self):
         """
-        Verify that the FM9G model configuration yields approximately 4.2B parameters.
-        Calculation: Embedding + 16 Layers (GQA + SwiGLU) + Untied LM Head.
+        Verify that the FM9G model configuration yields the expected parameter scale.
+        Logic: Summing up params from all sections in ModelContext.
         """
         path = self._create_config("FM9G", "decoder-only")
         parser = ModelParser(path)
         ctx = parser.parse()
         
-        mem_info = parser.estimate_model_static_memory(ctx)
-        params_b = mem_info["total_params_billions"]
+        # Calculate total params from all sections (in Billions)
+        total_params = sum(section.total_params for section in ctx.sections.values())
+        params_b = total_params / 1e9
         
         print(f"\n[Test] FM9G Estimated Parameters: {params_b:.3f} B")
         
-        # Expected value is ~4.25-4.26B based on the provided dimensions
+        # Expected value for FM9G-14B architecture with 16 layers is ~4.26B
         self.assertAlmostEqual(params_b, 4.26, delta=0.1)
 
-    def test_decoder_only_architecture(self):
-        """Verify parsing of GPT-style (decoder-only) models."""
-        # Use a smaller override to keep the test focused on structure
+    def test_decoder_only_topology(self):
+        """Verify parsing of GPT-style (decoder-only) Multi-Section IR."""
         overrides = {"architecture": {"num_layers": 12}}
         path = self._create_config("GPT_Small", "decoder-only", arch_overrides=overrides)
         parser = ModelParser(path)
@@ -114,26 +116,15 @@ class TestModelParser(unittest.TestCase):
         self.assertEqual(ctx.model_type, "decoder-only")
         self.assertIn("backbone", ctx.sections)
         
-        # Topology: 1 (Embed) + 12 (Blocks) + 1 (Head) = 14
-        flat_topology = ctx.get_flat_topology()
-        self.assertEqual(len(flat_topology), 14)
+        # Layers: 1 (Embed) + 12 (TransformerBlocks) + 1 (LM Head) = 14
+        layers = ctx.sections["backbone"].layers
+        self.assertEqual(len(layers), 14)
+        self.assertEqual(layers[0].type, "Embedding")
+        self.assertEqual(layers[-1].type, "Linear")
+        self.assertEqual(layers[1].type, "TransformerBlock")
 
-    def test_encoder_only_architecture(self):
-        """Verify parsing of BERT-style (encoder-only) models."""
-        overrides = {"architecture": {"num_layers": 12}}
-        path = self._create_config("BERT_Base", "encoder-only", arch_overrides=overrides)
-        parser = ModelParser(path)
-        ctx = parser.parse()
-        
-        self.assertEqual(ctx.model_type, "encoder-only")
-        self.assertIn("backbone", ctx.sections)
-        
-        # Topology: 1 (Embed) + 12 (Blocks) = 13
-        flat_topology = ctx.get_flat_topology()
-        self.assertEqual(len(flat_topology), 13)
-
-    def test_encoder_decoder_architecture(self):
-        """Verify complex T5-style (encoder-decoder) parsing."""
+    def test_encoder_decoder_dual_stream(self):
+        """Verify T5-style (encoder-decoder) parsing creates two distinct sections."""
         overrides = {"architecture": {"num_layers": 6}}
         path = self._create_config("T5_Small", "encoder-decoder", arch_overrides=overrides)
         parser = ModelParser(path)
@@ -145,37 +136,67 @@ class TestModelParser(unittest.TestCase):
         
         # Encoder: 1 (Embed) + 6 (Blocks) = 7
         # Decoder: 1 (Embed) + 6 (Blocks) + 1 (Head) = 8
-        # Total: 15
-        flat_topology = ctx.get_flat_topology()
-        self.assertEqual(len(flat_topology), 15)
+        self.assertEqual(len(ctx.sections["encoder"].layers), 7)
+        self.assertEqual(len(ctx.sections["decoder"].layers), 8)
+        
+        # Verify Cross-Attention presence in Decoder but not in Encoder
+        dec_block = ctx.sections["decoder"].layers[1]
+        roles = [comp.role for comp in dec_block.sub_components]
+        self.assertIn("cross_attn_qkv", roles)
+        
+        enc_block = ctx.sections["encoder"].layers[1]
+        roles_enc = [comp.role for comp in enc_block.sub_components]
+        self.assertNotIn("cross_attn_qkv", roles_enc)
 
-    def test_memory_and_flops_across_types(self):
-        """Ensure performance estimation works regardless of multi-section topology."""
-        path = self._create_config("Benchmark_Model", "decoder-only")
-        parser = ModelParser(path)
-        ctx = parser.parse()
+    def test_subcomponent_details(self):
+        """Verify that SubComponents carry correct parallel and operator metadata."""
+        path = self._create_config("FM9G_Detail", "decoder-only")
+        ctx = ModelParser(path).parse()
         
-        mem_info = parser.estimate_model_static_memory(ctx)
-        flops = parser.estimate_model_total_flops(ctx)
+        # Pick the first TransformerBlock
+        block = ctx.sections["backbone"].layers[1]
+        self.assertEqual(block.type, "TransformerBlock")
         
-        self.assertGreater(mem_info["total_params_billions"], 0)
-        self.assertGreater(flops, 0)
+        # Check QKV component (should be TP split on dim 0 for column parallel)
+        qkv = next(c for c in block.sub_components if c.role == "self_attn_qkv")
+        self.assertEqual(qkv.tp_split_dim, 0)
+        self.assertEqual(qkv.attention_type, "gqa") # 28 heads / 4 groups
+        
+        # Check MLP component (SwiGLU should have 2x multiplier in weight_shape)
+        mlp_gate = next(c for c in block.sub_components if c.role == "mlp_h_to_4h")
+        self.assertEqual(mlp_gate.fused_activation, "swiglu")
+        # ffn_hidden_size (18944) * 2 = 37888
+        self.assertEqual(mlp_gate.weight_shape[1], 37888)
 
-    def test_validation_mismatch(self):
-        """Verify the parser detects invalid section configurations."""
-        bad_config_path = self._create_config("Broken_Config", "decoder-only")
-        
-        with open(bad_config_path, "r") as f:
+    def test_validation_missing_metadata(self):
+        """Verify the parser detects missing mandatory metadata fields."""
+        path = self._create_config("Broken_Meta", "decoder-only")
+        with open(path, "r") as f:
             data = json.load(f)
         
-        # Remove a mandatory hyperparameter to trigger validation error
-        del data["training_hyperparams"]["precision"]
+        del data["model_metadata"]["framework"]
         
-        with open(bad_config_path, "w") as f:
+        with open(path, "w") as f:
             json.dump(data, f)
             
-        with self.assertRaises(ValueError):
-            ModelParser(bad_config_path)
+        with self.assertRaisesRegex(ValueError, "Metadata field 'framework' is mandatory"):
+            ModelParser(path)
+
+    def test_validation_type_mismatch(self):
+        """Verify the parser detects mismatch between model_type and existing sections."""
+        # Specifying decoder-only but providing an 'encoder' node (via helper)
+        path = self._create_config("Mismatch", "decoder-only")
+        with open(path, "r") as f:
+            data = json.load(f)
+        
+        # Force add an encoder section
+        data["encoder"] = data["decoder"]
+        
+        with open(path, "w") as f:
+            json.dump(data, f)
+            
+        with self.assertRaisesRegex(ValueError, "decoder-only.*encoder.*found"):
+            ModelParser(path)
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

@@ -1,10 +1,9 @@
 import time
-from typing import Dict, Any, List
+import threading
+from typing import Dict, Any, List, Set
 from core.common.protocol import JanusMessage, ActionCode, StatusCode, JanusFuture
-from core.common.cluster_context import NodeInfo
+from core.common.cluster_context import NodeInfo, CommPerformance, CollectiveType
 from core.master.orchestrator.messenger import MasterMessenger
-from core.master.orchestrator.dim_future import DimFuture
-
 
 class JanusMasterCollective:
     """
@@ -18,6 +17,11 @@ class JanusMasterCollective:
 
     def __init__(self, messenger: MasterMessenger):
         self.messenger = messenger
+        # Initialize a thread lock for synchronized access
+        self.sync_lock = threading.Lock()
+        
+        # Track processed task IDs to ensure idempotency across nodes
+        self.processed_task_ids: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Task Submission
@@ -28,7 +32,7 @@ class JanusMasterCollective:
         Submit a task to all slaves. Returns a Future immediately.
         """
         msg = JanusMessage(
-            source_rank=0,
+            source_rank=-1,
             target="ALL",
             action=action,
             payload=payload or {}
@@ -47,7 +51,7 @@ class JanusMasterCollective:
         Submit a task to a specific slave. Returns a Future immediately.
         """
         msg = JanusMessage(
-            source_rank=0,
+            source_rank=-1,
             target=str(rank),
             action=action,
             payload=payload or {}
@@ -126,19 +130,39 @@ class JanusMasterCollective:
         Entry point for synchronizing probe results into ClusterContext.
         """
         if msg.status != StatusCode.SUCCESS:
-            print(f"[Error] Action {msg.action} failed on Rank {msg.source_rank}: {msg.error_msg}")
+            print(f"[Error] Action {msg.action} failed on Rank {msg.source_rank}: {msg.payload.get('error', 'Unknown')}")
             return
 
-        target_node = self.messenger.cluster.nodes.get(msg.source_rank)
-        if not target_node:
-            return
+        # Map source_rank to target_node
+        # For simplicity, we use the rank as index, but with a fallback for single-node tests
+        node_idx = msg.source_rank
+        if node_idx >= len(self.messenger.cluster.nodes):
+            if len(self.messenger.cluster.nodes) == 1:
+                node_idx = 0
+            else:
+                print(f"[Error] Rank {msg.source_rank} out of bounds for cluster nodes")
+                return
+        target_node = self.messenger.cluster.nodes[node_idx]
+
+        with self.sync_lock:
+            # Handle network probe deduplication
+            if msg.action in [ActionCode.PROBE_NET_INTRA, ActionCode.PROBE_NET_INTER]:
+                data = msg.payload
+                task_id = data.get("task_id")
+                if not task_id:
+                    return
+                
+                if task_id in self.processed_task_ids:
+                    # Drop redundant reports from other nodes in the same group
+                    return
+                
+                # Mark task as completed before writing to the matrix
+                self.processed_task_ids.add(task_id)
 
         if msg.action == ActionCode.PROBE_ENV:
             self._sync_env_metrics(target_node, msg.payload)
         elif msg.action == ActionCode.PROBE_COMPUTE:
             self._sync_compute_metrics(target_node, msg.payload)
-        elif msg.action == ActionCode.PROBE_NET_INTRA:
-            self._sync_intra_net_metrics(target_node, msg.payload)
         elif msg.action in [ActionCode.PROBE_NET_INTRA, ActionCode.PROBE_NET_INTER]:
             self._sync_network_performance(msg.payload)
 
@@ -191,53 +215,75 @@ class JanusMasterCollective:
 
     def _sync_network_performance(self, data: Dict[str, Any]):
         """
-        Core logic: Write back performance results to the strategy_matrix based on task_id and strategy metadata.
+        Synchronizes network probe results into the cluster context.
+        Updates 'all_case' for full profiling and 'the_worst_case'/'dimension_performance' 
+        for bottleneck tracking using a bandwidth-first logic.
         """
-        task_id = data.get("task_id")
-        dim = data.get("dim")           # 'tp', 'dp' or 'pp'
-        strategy_raw = data.get("strategy") # might be [tp, pp, dp]
+        dim = data.get("dim")           # 'tp', 'dp', 'pp'
+        strategy_raw = data.get("strategy")
+        group_list = data.get("group")
         perf_dict = data.get("perf")
-
-        if not all([dim, strategy_raw, perf_dict]):
-            print(f"[Warning] Incomplete network performance data for task {task_id}")
+        
+        if not all([dim, strategy_raw, group_list, perf_dict]):
             return
 
-        # 1. Convert strategy to Tuple to match the Key (tp, pp, dp) of strategy_matrix
-        strategy_key = tuple(strategy_raw) if isinstance(strategy_raw, list) else strategy_raw
+        # 1. Convert to hashable types
+        strategy_key = tuple(strategy_raw)
+        group_key = tuple(group_list)
         
-        # 2. Retrieve the corresponding ParallelStrategyPerformance object
-        # Note: This object should have been created by init_parallel_strategy before dispatching the probing task
         strategy_perf = self.messenger.cluster.strategy_matrix.get(strategy_key)
-        
         if not strategy_perf:
-            print(f"[Error] Strategy {strategy_key} not found in matrix for task {task_id}")
             return
+        
+        # Determine protocol: PP is typically P2P, others are Collective
+        coll_type = CollectiveType.P2P if dim == "pp" else CollectiveType.ALL_REDUCE
 
-        # 3. Restore Dict to CommPerformance dataclass object
-        from core.common.cluster_context import CommPerformance
-        new_perf = CommPerformance(**perf_dict)
+        # 2. Restore performance object from payload
+        incoming_perf = CommPerformance(**perf_dict)
 
-        # 4. Update the strategy matrix
-        # communication_performance structure: { "tp": { (group_tuple): CommPerformance } }
-        # The group key was not returned by the Slave side as a full group_tuple (to save bandwidth)
-        # But since it is a collective, all ranks in the same group measure the same group's performance.
-        # We adopt an overwriting update strategy here.
-        if dim in strategy_perf.communication_performance:
-            # Find the corresponding group under this dimension
-            # Because a node may belong to multiple groups (though in the current probing logic usually one task corresponds to one group)
-            # We directly update all group sampling points under this dimension, or precisely update by group_idx
-            group_idx = data.get("group_idx")
-            groups = strategy_perf.communication_groups.get(dim, [])
+        # 3. Ensure dictionary hierarchy for the dimension exists in all stores
+        for store in [strategy_perf.all_case, 
+                      strategy_perf.the_worst_case, 
+                      strategy_perf.dimension_performance]:
+            if dim not in store:
+                store[dim] = {}
+
+        # ---------------------------------------------------------
+        # Logic A: Persistence (Update all_case)
+        # ---------------------------------------------------------
+        # Map: dim -> group_ranks -> coll_type -> performance
+        if group_key not in strategy_perf.all_case[dim]:
+            strategy_perf.all_case[dim][group_key] = {}
+
+        import copy
+        strategy_perf.dimension_performance[dim][coll_type] = copy.deepcopy(incoming_perf)
+
+        # ---------------------------------------------------------
+        # Logic B: Bottleneck Tracking (Update the_worst_case & dimension_performance)
+        # ---------------------------------------------------------
+        # Use .get() to safely retrieve current worst performance
+        current_worst_perf = strategy_perf.dimension_performance[dim].get(coll_type)
+
+        # Straggler Decision: Bandwidth-First
+        is_new_straggler = (
+            current_worst_perf is None or 
+            incoming_perf.bandwidth_gbps < current_worst_perf.bandwidth_gbps
+        )
+
+        if is_new_straggler:
+            # Record "How much" it sucks (for Cost Model)
+            strategy_perf.dimension_performance[dim][coll_type] = incoming_perf
+            # Record "Who" sucks (for Profiling/Root Cause)
+            strategy_perf.the_worst_case[dim][coll_type] = group_key
             
-            if group_idx is not None and group_idx < len(groups):
-                group_key = tuple(groups[group_idx])
-                strategy_perf.communication_performance[dim][group_key] = new_perf
-                
-                print(f"[Master] Strategy {strategy_key} | {dim.upper()} Group {group_idx} updated: "
-                      f"BW={new_perf.bandwidth_gbps}Gbps, Latency={new_perf.latency_us}us")
-            else:
-                # If no group_idx is provided, update as a global reference value for this dimension
-                print(f"[Warning] No group_idx provided for task {task_id}, skipping precise update.")
+            print(f"[Master] NEW Bottleneck for {dim.upper()} strategy {strategy_key}: "
+                  f"Group {group_key} @ {incoming_perf.bandwidth_gbps} Gbps")
+        else:
+            # Use .get() for the log to prevent KeyError if this is the first sample 
+            # and it's somehow not considered a straggler (though None case handles first)
+            current_worst_group = strategy_perf.the_worst_case[dim].get(coll_type, group_key)
+            print(f"[Master] Group {group_key} logged. Current bottleneck remains "
+                  f"{current_worst_group}")
 
     
 

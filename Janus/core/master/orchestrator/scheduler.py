@@ -1,4 +1,5 @@
 import time
+from typing import List
 from core.master.parser.cluster_parser import ClusterParser
 from core.master.parser.model_parser import ModelParser
 from core.master.orchestrator.messenger import MasterMessenger
@@ -37,15 +38,15 @@ class JanusOrchestrator:
     # benchmarks so needs more headroom.
     PROBE_ENV_TIMEOUT_S: float = 60.0
     PROBE_COMPUTE_TIMEOUT_S: float = 180.0
-    PROBE_COMPUTE_TIMEOUT_S: float = 180.0
+    PROBE_NETWORK_TIMEOUT_S: float = 180.0
 
     # Poll interval used while waiting for all slaves to come online.
     _CONNECT_POLL_INTERVAL_S: float = 1.0
+    GLOBAL_WORLD_PORT: int = 29500
 
-    def __init__(self, model_config_path: str, cluster_config_path: str, rank: int):
+    def __init__(self, model_config_path: str, cluster_config_path: str):
         self.model_config_path   = model_config_path
         self.cluster_config_path = cluster_config_path
-        self.rank = rank
 
         # Parse configuration files.
         self.model_parser   = ModelParser(model_config_path)
@@ -54,8 +55,8 @@ class JanusOrchestrator:
         # Note: use self.* here — original code accidentally referenced the
         # bare local names model_parser / cluster_parser which would raise
         # NameError at construction time.
-        self.model_context   = self.model_parser.parser()
-        self.cluster_context = self.cluster_parser.parser()
+        self.model_context   = self.model_parser.parse()
+        self.cluster_context = self.cluster_parser.parse()
 
         # Network identity.
         # cluster_context.master_addr is the bind address (e.g. "0.0.0.0" or a
@@ -71,7 +72,7 @@ class JanusOrchestrator:
 
         # Communication layer.
         self.messenger  = MasterMessenger(
-            self.host, self.port, self.rank,
+            self.host, self.port,
             self.expected_slaves, self.cluster_context,
         )
         self.collective = JanusMasterCollective(self.messenger)
@@ -100,8 +101,10 @@ class JanusOrchestrator:
 
         try:
             self._wait_for_all_slaves()
+            self._create_group()
             self._probe_env()
             self._probe_compute()
+            self._probe_network()
         finally:
             # Ensure the messenger is cleanly shut down even if a probe fails.
             self.messenger.close()
@@ -122,6 +125,39 @@ class JanusOrchestrator:
             )
         
         print("[Orchestrator] Cluster is ready for probing.")
+
+    def _create_group(self):
+        """
+        Broadcast CREATE_GROUP to all slaves to initialize a persistent 
+        global Process Group (WORLD).
+        
+        This rendezvous allows all GPUs in the cluster to see each other 
+        once and maintain a long-lived NCCL communicator.
+        """
+        print(f"[Orchestrator] Phase 0.5 — Broadcasting CREATE_GROUP (Global WORLD)...")
+        
+        # We use the Orchestrator's host IP as the master address for NCCL.
+        # total_gpus is the sum of all GPUs across all expected slaves.
+        payload = {
+            "master_addr": self.host, 
+            "master_port": self.GLOBAL_WORLD_PORT,
+            "world_size": self.cluster_context.total_gpus,
+            "backend": "nccl"
+        }
+
+        # Broadcast to ALL slaves. 
+        # Every slave will receive this and trigger its internal worker pool.
+        future = self.collective.submit(ActionCode.CREATE_GROUP, payload=payload)
+
+        # This is a critical sync point. If one node fails to join the WORLD,
+        # all subsequent network probes will likely hang or fail.
+        result = future.result(
+            timeout=self.PROBE_NETWORK_TIMEOUT_S,
+            min_success_ratio=1.0, # Strict: Every node must join
+        )
+
+        self._assert_quorum(result, phase="CREATE_GROUP")
+        print("[Orchestrator] Global Process Group (WORLD) established across all nodes.")
 
     # ------------------------------------------------------------------
     # Probe phases
@@ -255,7 +291,7 @@ class JanusOrchestrator:
 
                 # --- 4. Global Barrier & Cleanup ---
                 # Ensure all slaves have released NCCL communicators and finished IO
-                self.collective.barrier(f"End-of-{dim}-{strategy}")
+                self.collective.barrier(timeout=self.PROBE_NETWORK_TIMEOUT_S)
                 print(f"[Orchestrator] Completed Dimension: {dim.upper()}")
 
     def _dispatch_group(self, dim, strategy, group_idx, group, task_id, is_intra) -> List:
