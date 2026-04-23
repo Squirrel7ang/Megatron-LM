@@ -1,8 +1,9 @@
-from typing import List, Union
+from typing import List, Union, Optional
 
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from jiuge.config.fm9g_config import FM9GConfig
 from jiuge.fm9g import FM9GModel
 
@@ -10,7 +11,8 @@ def fm9g_builder(
     pre_process: bool, 
     post_process: bool, 
     vp_stage: int = None,
-    config: FM9GConfig = None
+    config: FM9GConfig = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> Union[FM9GModel, List[FM9GModel]]:
     """
     Builder function for FM9G model.
@@ -68,6 +70,7 @@ def fm9g_builder(
         parallel_output=True, 
         share_embeddings_and_output_weights=share_embeddings,
         vp_stage=vp_stage,
+        pg_collection=pg_collection,
     )
 
     return model
