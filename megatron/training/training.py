@@ -1468,6 +1468,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
             kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
             kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
+            kwargs['use_arc_topk'] = args.use_arc_topk
+            kwargs['arc_topk_priority_rank'] = args.arc_topk_priority_rank
+            assert 0 < args.arc_topk_compression_ratio < 1, \
+                "--arc-topk-compression-ratio must be between 0 and 1"
+            kwargs['arc_topk_compression_ratio'] = args.arc_topk_compression_ratio
+            kwargs['use_grad_quantization'] = args.use_grad_quantization
+            kwargs['grad_sync_comm_dtype'] = args.grad_sync_comm_dtype
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)

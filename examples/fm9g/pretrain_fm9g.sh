@@ -114,11 +114,9 @@ TRAINING_ARGS=(
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --adam-eps 1e-6 
-    # --use-distributed-optimizer true 
-    --use-distributed-optimizer 
+    --use-distributed-optimizer
     --log-interval 1 
-    # --log-throughput true 
-    --log-throughput 
+    --log-throughput
     --no-overlap-p2p-communication 
     # --use-distributed-optimizer 
     # --recompute-granularity selective 

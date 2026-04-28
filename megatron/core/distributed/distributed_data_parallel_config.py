@@ -202,6 +202,21 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    use_arc_topk: bool = False
+
+    arc_topk_priority_rank: int = 4
+
+    arc_topk_compression_ratio: float = 0.5
+
+    use_grad_quantization: bool = False
+
+    use_error_feedback: bool = False
+
+    grad_quantization_dtype: Optional[torch.dtype] = None
+    """
+      FP8, INT8
+    """
+
     def __post_init__(self):
         import os
 
