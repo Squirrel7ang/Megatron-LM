@@ -2753,6 +2753,22 @@ def _add_distributed_args(parser):
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
+    group.add_argument('--use-arc-topk', action='store_true', default=False,
+                       help='Enable ARC-TopK gradient compression algorithm.')
+    group.add_argument('--arc-topk-priority-rank', type=int, default=4,
+                       help='Priority rank (r) for ARC-TopK projection matrix.')
+    group.add_argument('--arc-topk-compression-ratio', type=float, default=0.5,
+                       help='Compression ratio for ARC-TopK. Value between 0 and 1, '
+                            'where 0.5 means 50% of the rows are communicated.')
+    group.add_argument('--use-grad-quantization', action='store_true', default=False,
+                       help='Enable quantization for gradient communication.')
+    group.add_argument('--grad-quantization-dtype', type=str, default=None,
+                       choices=['int8', 'fp8', 'int4'],
+                       help='The target data type for gradient quantization. '
+                            'Common choices are int8 or fp8.')
+    group.add_argument('--use-error-feedback', action='store_true', default=False,
+                       help='Enable error feedback mechanism to compensate for '
+                            'compression/quantization error across iterations.')
     return parser
 
 
