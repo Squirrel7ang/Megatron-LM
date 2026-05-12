@@ -233,6 +233,10 @@ class DistributedDataParallel(_BaseDataParallel):
                         self.inter_dist_opt_group
                     )
                     bucket_group.communication_stream = communication_stream
+            elif self.ddp_config.use_arc_topk:
+                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                for bucket_group in bucket_groups:
+                    bucket_group.communication_stream = communication_stream
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).

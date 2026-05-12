@@ -206,7 +206,7 @@ class DistributedDataParallelConfig:
 
     arc_topk_priority_rank: int = 4
 
-    arc_topk_compression_ratio: float = 0.5
+    arc_topk_compression_ratio: float = 0.10
 
     use_grad_quantization: bool = False
 

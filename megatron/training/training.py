@@ -1474,7 +1474,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 "--arc-topk-compression-ratio must be between 0 and 1"
             kwargs['arc_topk_compression_ratio'] = args.arc_topk_compression_ratio
             kwargs['use_grad_quantization'] = args.use_grad_quantization
-            kwargs['grad_sync_comm_dtype'] = args.grad_sync_comm_dtype
+            kwargs['grad_quantization_dtype'] = args.grad_quantization_dtype
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
@@ -2833,6 +2833,10 @@ def train(
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),
                 warmup=1 if args.profile_step_start > 0 else 0,

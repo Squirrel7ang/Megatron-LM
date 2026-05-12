@@ -19,7 +19,6 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
-from .grad_compression import init_grad_quantization_state
 
 from ..fp8_utils import (
     is_float8tensor,
@@ -200,6 +199,7 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+        self.communication_stream = None
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
@@ -585,6 +585,13 @@ class _ParamAndGradBucketGroup:
             # to complete its gradient computation before launching the next
             # gradient reduction collective.
             self.communication_stream.wait_stream(torch.cuda.current_stream())
+        elif (
+            self.ddp_config.use_arc_topk
+            and self.ddp_config.overlap_grad_reduce
+        ):
+            stream_context = torch.cuda.stream(self.communication_stream)
+            self.communication_stream.wait_stream(torch.cuda.current_stream())
+            # logger.info("cuda stream context created")
         else:
             stream_context = nullcontext()
 
@@ -606,7 +613,7 @@ class _ParamAndGradBucketGroup:
             state = get_arc_topk_state()
             state.start_grad_sync(self.buckets, stream_context, async_op)
         elif self.ddp_config.use_grad_quantization and not force_all_reduce:
-            from .grad_compression import get_grad_quantization_state
+            from .grad_compression import init_grad_quantization_state, get_grad_quantization_state
             init_grad_quantization_state(
                 communication_group,
                 self.ddp_config.use_error_feedback,
@@ -680,6 +687,8 @@ class _ParamAndGradBucketGroup:
                 # collective handle's .wait() method, so we take matters into our own hands here.
                 assert grad_reduce_handle is not None
                 self.grad_reduce_handle = grad_reduce_handle
+            elif self.ddp_config.use_arc_topk:
+                self.grad_reduce_handle = None
             else:
                 self.grad_reduce_handle = cm
         else:
@@ -705,14 +714,6 @@ class _ParamAndGradBucketGroup:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
             self._copy_back_extra_main_grads()
             return
-        if self.ddp_config.use_arc_topk:
-            from .grad_compression import get_arc_topk_state
-            state = get_arc_topk_state()
-            state.finish_grad_sync()
-        if self.ddp_config.use_grad_quantization:
-            from .grad_compression import get_grad_quantization_state
-            state = get_grad_quantization_state()
-            state.finish_grad_sync()
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
         # populated at the end of this first batch.
@@ -720,6 +721,20 @@ class _ParamAndGradBucketGroup:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
+        if self.ddp_config.use_arc_topk:
+            from .grad_compression import get_arc_topk_state
+            state = get_arc_topk_state()
+            state.finish_grad_sync()
+            self.grad_reduce_handle = None
+            self._copy_back_extra_main_grads()
+            return
+        if self.ddp_config.use_grad_quantization:
+            from .grad_compression import get_grad_quantization_state
+            state = get_grad_quantization_state()
+            state.finish_grad_sync()
+            self.grad_reduce_handle = None
+            self._copy_back_extra_main_grads()
+            return
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
             self._copy_back_extra_main_grads()

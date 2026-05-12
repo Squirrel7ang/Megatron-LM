@@ -109,7 +109,7 @@ TRAINING_ARGS=(
     --lr-decay-style cosine 
     --lr-warmup-fraction 0.02 
     --bf16
-    --train-iters 100
+    --train-iters 30
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
@@ -118,17 +118,19 @@ TRAINING_ARGS=(
     --log-interval 1 
     --log-throughput
     --no-overlap-p2p-communication 
-    # --use-distributed-optimizer 
     # --recompute-granularity selective 
     --use-flash-attn 
     --pos-bias-type rotary
     
     --overlap-grad-reduce 
-    --overlap-grad-gather 
+    # --overlap-grad-gather 
+    
+    # --use-arc-topk
+    # --arc-topk-compression-ratio 0.1
 )
 
 MODEL_PARALLEL_ARGS=(
-	--tensor-model-parallel-size 4 
+	--tensor-model-parallel-size 1 
 	--pipeline-model-parallel-size 1 
 
     # --use-torch-fsdp2 
@@ -140,6 +142,14 @@ DATA_ARGS=(
     # --vocab-file $VOCAB_FILE 
     # --merge-file $MERGE_FILE 
     # --split 949,50,1
+)
+
+PROFILING_ARGS=(
+    --profile
+    --profile-step-start 8
+    --profile-step-end 10
+    --profile-ranks 0
+    --use-pytorch-profiler
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -167,6 +177,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_fm9g.py \
     ${GPT_MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
+    ${PROFILING_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${DATA_ARGS[@]} \
 

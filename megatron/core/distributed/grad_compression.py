@@ -1,6 +1,7 @@
 import math
 import logging
 from typing import List
+import traceback
 
 import torch
 import torch.distributed as dist
@@ -18,8 +19,8 @@ logger = logging.getLogger(__name__)
 def init_arc_topk_state(
         process_group,
         priority_rank,
-        compression_ratio,
-        use_error_feedback = False,
+        compression_ratio=0.1,
+        use_error_feedback=False,
 ):
     global _ARC_TOPK_STATE
     if _ARC_TOPK_STATE is None:
@@ -168,6 +169,9 @@ def _dequantize_per_channel_backend(y, scale, zero_point):
     return x
 
 
+cnt=0
+
+
 class ArcTopkState:
     def __init__(
         self,
@@ -188,12 +192,17 @@ class ArcTopkState:
         self.use_error_feedback = use_error_feedback
         self.error_dict = {}
         self.all_futs = []
+        self.infos = {}
+        self.cm = None
+        self.stream_context = None
+        self.buckets = []
 
 
-    def start_grad_sync_overlap(
+    def start_grad_sync(
         self,
         buckets: List[_ParamAndGradBucket],
-        stream_context: torch.stream.StreamContext,
+        stream_context,
+        # stream_context: torch.cuda.StreamContext,
         async_op: bool = False
     ):
         r"""
@@ -223,81 +232,188 @@ class ArcTopkState:
 
             3.1. let compressed gradient matrix G_i be G[Indices, :] and perform an All-Reduce on G'.
         """
-        def _cal_max_factor(size: int):
-            factor: int = 1
-            while size % factor == 0 and size / factor > factor:
-                factor *= 2
-            return factor
-        pass
+        global cnt
+        cnt += 1
 
-        # indices_holder = {}
-        infos = []
-        # comm_futs = []
-
-        world_size = self.process_group.size()
+        self.all_futs = []
+        
         process_group = self.process_group
+        rank = process_group.rank()
+        # logger.info(f"Start Grad Sync Begin {cnt=}, rank={rank}")
 
+        self.stream_context = stream_context
+        self.buckets = buckets
+        # 显式遍历每一个 bucket
         with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
-            for _, bucket in enumerate(buckets):
+            for bucket in buckets:
+
+                def _cal_max_factor(size: int):
+                    factor: int = 1
+                    while size % factor == 0 and size / factor > factor:
+                        factor *= 2
+                    if size % factor != 0:
+                        factor = factor // 2
+                    return factor
+
+                # 在 Megatron 中使用 bucket.grad_data 代替 bucket.buffer()
                 gradient = bucket.grad_data
-                gradient = gradient.view(-1, row_num)
                 d = gradient.numel()
                 row_num = _cal_max_factor(d)
+                gradient = gradient.view(-1, row_num)
 
+                # calculate global priority
                 V = torch.randn(row_num, self.priority_rank, device=gradient.device, dtype=gradient.dtype)
                 P = torch.matmul(gradient, V) / math.sqrt(self.priority_rank)
-
-                fut_p = dist.all_reduce(
-                    P, group=process_group, async_op=async_op
+                
+                # 发起第一次 All-Reduce
+                dist.all_reduce(
+                    P, group=self.process_group, async_op=async_op
                 )
-
-                info = {
-                    "future": fut_p,
+                self.infos[bucket.bucket_id] = {
+                    "gradient": gradient,
+                    "P": P,
                     "d": d,
                     "row_num": row_num,
-                    "gradient": gradient,
                 }
-                infos.append(info)
+                # logger.info(f"{bucket.bucket_id=}, {d=}, {row_num=}")
+                
+        # 先保证正确性。理论上一个 CUDA Stream 应该是顺序执行的。
+        cm.wait()
 
+        with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
+            for bucket in buckets:
+                info = self.infos[bucket.bucket_id]
+                gradient = info["gradient"]
+                P = info["P"]
+                d = info["d"]
+                row_num = info["row_num"]
 
-        for info in infos:
-            fut_p = info["future"].get_future()
-
-            def compress_and_sync(fut):
-                synced_P = fut.value()[0]
-                score = torch.diag(torch.matmul(synced_P, synced_P.T))
-
-                col_num = info["d"] / info["row_num"]
+                # logger.info(f"290: {bucket.bucket_id=}, {d=}, {row_num=}")
+                
+                score = (P * P).sum(dim=1)
+                col_num = d / row_num
                 K = max(1, int(col_num * self.compression_ratio))
                 indices = torch.topk(score, k=K).indices
-                info['indices'] = indices
+                
+                comm_gradient = gradient[indices, :]
+                dist.all_reduce(
+                    comm_gradient, group=self.process_group, async_op=async_op
+                )
+                self.infos[bucket.bucket_id]["comm_gradient"] = comm_gradient
+                self.infos[bucket.bucket_id]["indices"] = indices
+                
+        self.cm = cm
+        # logger.info(f"Start Grad Sync End {cnt=}, rank={rank}")
 
-                comm_gradient = info["gradient"][indices, :]
 
-                return dist.all_reduce(
-                    comm_gradient, group=self.process_group, async_op=True
-                ).get_future()
+        # with stream_context:
+        #     for bucket in buckets:
+        #         # --- 以下代码完全保留源代码变量名称与逻辑 ---
+                
+        #         process_group = self.process_group
+        #         # 适配 Megatron 进程组获取逻辑
+        #         group_to_use = (
+        #             process_group if process_group is not None else dist.group.WORLD
+        #         )
+        #         world_size = dist.get_world_size(group=group_to_use)
 
-            def decompress_and_finalize(fut):
+        #         def _cal_max_factor(size: int):
+        #             factor: int = 1
+        #             while size % factor == 0 and size / factor > factor:
+        #                 factor *= 2
+        #             if size % factor != 0:
+        #                 factor = factor // 2
+        #             return factor
+
+        #         # 在 Megatron 中使用 bucket.grad_data 代替 bucket.buffer()
+        #         gradient = bucket.grad_data
+        #         d = gradient.numel()
+        #         row_num = _cal_max_factor(d)
+        #         gradient = gradient.view(-1, row_num)
+
+        #         # calculate global priority
+        #         V = torch.randn(row_num, self.priority_rank, device=gradient.device, dtype=gradient.dtype)
+        #         P = torch.matmul(gradient, V) / math.sqrt(self.priority_rank)
+                
+        #         # 发起第一次 All-Reduce
+        #         fut = dist.all_reduce(
+        #             P, group=self.process_group, async_op=async_op
+        #         ).get_future()
+                
+        #         # 为当前 bucket 独立维护 indices_holder 避免多 bucket 并发干扰
+        #         indices_holder = []
+
+        #         def compress_and_allreduce(fut):
+        #             # fut 是前一个阶段返回的 future，通过 wait() 或 value() 获取 P
+        #             score = (P * P).sum(dim=1)
+        #             # score = torch.diag(torch.matmul(P, P.T))
+        #             col_num = d / row_num
+        #             K = max(1, int(col_num * self.compression_ratio))
+        #             indices = torch.topk(score, k=K).indices
+        #             indices_holder.append(indices)
+
+        #             comm_gradient = gradient[indices, :]
+        #             comm_fut = dist.all_reduce(
+        #                 comm_gradient, group=self.process_group, async_op=async_op
+        #             ).get_future()
+
+        #             # 原代码逻辑：返回 wait() 的结果
+        #             return comm_fut.wait()
+
+        #         def decompress_and_finalize(fut):
+        #             # 获取第二次 All-Reduce 的结果
+        #             avg_gradient = fut.wait()[0] / world_size
+        #             indices = indices_holder[0]
+        #             gradient.zero_()
+        #             gradient[indices, :] = avg_gradient
+
+        #             return gradient
+
+        #         # 链式调用并将最终的 future 存入列表
+        #         # 注意：这里的 .then() 逻辑会按顺序在后台执行
+        #         chained_fut = fut.then(compress_and_allreduce).then(decompress_and_finalize)
+        #         self.all_futs.append(chained_fut)
+
+    def finish_grad_sync(
+        self,
+        # buckets: List[_ParamAndGradBucket],
+        # stream_context,
+    ):
+        """
+        确保在这之前完成所有梯度的同步。
+        """
+        # if self.all_futs:
+        #     for fut in self.all_futs:
+        #         # 阻塞直到该 bucket 的整个异步链条（P 同步 -> 计算 -> G 同步 -> 还原）完成
+        #         fut.wait()
+        #     # 清空以备下一轮使用
+        #     self.all_futs = []
+        
+        if self.stream_context == None:
+            return
+        
+        rank = self.process_group.rank() if self.process_group else -1
+        global cnt
+        # logger.info(f"393:{rank=}, {cnt=}, {self.stream_context=}, {len(self.buckets)=}")
+
+        group_to_use = (
+            self.process_group if self.process_group is not None else dist.group.WORLD
+        )
+        world_size = dist.get_world_size(group=group_to_use)
+        
+        with self.stream_context:
+            self.cm.wait()
+            for bucket in self.buckets:
+                info = self.infos[bucket.bucket_id]
                 gradient = info["gradient"]
-                avg_gradient = fut.wait()[0] / world_size
+                comm_gradient = info["comm_gradient"]
                 indices = info["indices"]
+                avg_gradient = comm_gradient / world_size
                 gradient.zero_()
                 gradient[indices, :] = avg_gradient
-
-                return gradient
-
-            self.all_futs.append(
-                fut_p.then(compress_and_sync).then(decompress_and_finalize)
-            )
-
-    def finish_grad_sync(self):
-        if self.all_futs:
-            return
-        for fut in self.all_futs:
-            fut.wait()
-        self.all_futs = []
-
+        self.infos = {}
+        self.stream_context = None
+        self.buckets = []
 
 
 class GradQuantizationState:
@@ -329,7 +445,7 @@ class GradQuantizationState:
     def start_grad_sync(
             self,
             buckets: List[_ParamAndGradBucket],
-            stream_context: torch.stream.StreamContext,
+            stream_context: torch.cuda.StreamContext,
             async_op: bool = False
     ):
         def _get_all_gather_out_list(all_gather_in_list, world_size):
