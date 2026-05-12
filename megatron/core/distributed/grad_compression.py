@@ -257,6 +257,8 @@ class ArcTopkState:
 
                 # 在 Megatron 中使用 bucket.grad_data 代替 bucket.buffer()
                 gradient = bucket.grad_data
+                if self.use_error_feedback and self.error_dict[bucket.bucket_id] is not None:
+                    gradient += self.error_dict[bucket.bucket_id]
                 d = gradient.numel()
                 row_num = _cal_max_factor(d)
                 gradient = gradient.view(-1, row_num)
@@ -296,6 +298,8 @@ class ArcTopkState:
                 indices = torch.topk(score, k=K).indices
                 
                 comm_gradient = gradient[indices, :]
+                err_gradient = gradient - comm_gradient
+                self.error_dict[bucket.bucket_id] = err_gradient
                 dist.all_reduce(
                     comm_gradient, group=self.process_group, async_op=async_op
                 )
