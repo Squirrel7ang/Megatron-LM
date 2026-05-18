@@ -451,16 +451,22 @@ class GradQuantizationState:
             stream_context: torch.cuda.StreamContext,
             async_op: bool = False
     ):
-        def _get_all_gather_out_list(all_gather_in_list, world_size):
-            out_list = [
-                torch.zeros_like(
-                    all_gather_in_list,
-                    device=all_gather_in_list.device,
-                    dtype=all_gather_in_list.dtype,
-                )
-                for _ in range(world_size)
-            ]
-            return out_list
+        def _get_all_gather_out_list(tensor, world_size):
+            shape = (world_size,) + tensor.shape
+            coalescing_tensor = torch.zeros(
+                size=shape,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+
+            out_list = [coalescing_tensor[r] for r in range(world_size)]
+
+            return coalescing_tensor, out_list
+
+        # def coalescing_all_gather(coalescing_tensor, tensor, group=None, async_op=False):
+        #     dist.all_gather_into_tensor(
+        #         coalescing_tensor, tensor, group=group, async_op=async_op
+        #     )
 
         process_group = self.process_group
         rank = process_group.rank() if process_group is not None else dist.get_rank()
@@ -536,14 +542,17 @@ class GradQuantizationState:
 
                 packed_data = torch.cat([comm_s_and_z, comm_gradient])
 
-                all_packed_data = _get_all_gather_out_list(packed_data, world_size)
+                coalescing_data, packed_data_list = _get_all_gather_out_list(packed_data, world_size)
 
-                dist.all_gather(
-                    all_packed_data, packed_data, group=process_group, async_op=True
+                dist.all_gather_into_tensor(
+                    coalescing_data,
+                    packed_data,
+                    group=process_group,
+                    async_op=async_op,
                 )
 
                 self.all_infos[bucket_index] = {
-                    "data": all_packed_data,
+                    "packed_data_list": packed_data_list,
                     "grad_shape": grad_shape,
                     "s_and_z_dtype": s_and_z_dtype,
                     "s_and_z_size": s_and_z_size,
@@ -551,16 +560,16 @@ class GradQuantizationState:
 
         for bucket in buckets:
             info = self.all_infos[bucket.bucket_id]
-            all_packed_data = info["data"]
+            packed_data_list = info["packed_data_list"]
             grad_shape = info["grad_shape"]
             s_and_z_size = info["s_and_z_size"]
             s_and_z_dtype = info["s_and_z_dtype"]
-            s_and_z = all_packed_data[:s_and_z_size].view(s_and_z_dtype)
-            comm_gradient = all_packed_data[s_and_z_size:].view(grad_shape)
+            s_and_z = packed_data_list[:s_and_z_size].view(s_and_z_dtype)
+            comm_gradient = packed_data_list[s_and_z_size:].view(grad_shape)
 
             aggregated_grad = torch.zeros(size=grad_shape, dtype=original_dtype, device=comm_gradient.device)
 
-            for i, packed_data in enumerate(all_packed_data):
+            for i, packed_data in enumerate(packed_data_list):
                 aggregated_grad += _dequantize_per_tensor_backend(
                     comm_gradient, s_and_z[i][0], s_and_z[i][1], dtype=original_dtype,
                 )

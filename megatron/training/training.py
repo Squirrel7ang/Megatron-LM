@@ -1474,7 +1474,16 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 "--arc-topk-compression-ratio must be between 0 and 1"
             kwargs['arc_topk_compression_ratio'] = args.arc_topk_compression_ratio
             kwargs['use_grad_quantization'] = args.use_grad_quantization
-            kwargs['grad_quantization_dtype'] = args.grad_quantization_dtype
+            if args.grad_quantization_dtype == "bf16":
+                kwargs['grad_quantization_dtype'] = torch.bfloat16
+            elif args.grad_quantization_dtype == "fp16":
+                kwargs['grad_quantization_dtype'] = torch.bfloat16
+            elif args.grad_quantization_dtype == "fp8":
+                kwargs['grad_quantization_dtype'] = torch.float8_e4m3fn
+            elif args.grad_quantization_dtype == "int8":
+                kwargs['grad_quantization_dtype'] = torch.int8
+            else:
+                kwargs['grad_quantization_dtype'] = args.grad_quantization_dtype
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
