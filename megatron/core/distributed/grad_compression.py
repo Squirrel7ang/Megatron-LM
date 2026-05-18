@@ -443,8 +443,7 @@ class GradQuantizationState:
         self.error_dict = {}
         self.dtype = dtype
         self.use_hadamard_transformation = use_hadamard_transformation
-        self.all_infos = []
-        self.all_futs = []
+        self.all_infos = {}
 
     def start_grad_sync(
             self,
@@ -469,8 +468,39 @@ class GradQuantizationState:
         world_size = process_group.size()
         original_dtype = buckets[0].grad_data.dtype if buckets else torch.float32
 
+        # with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
+        #     for bucket in buckets:
+        #         gradient = bucket.grad_data
+        #         bucket_index = bucket.bucket_id
+        #         total_length = gradient.shape[0]
+        #         if self.use_error_feedback:
+        #             if bucket_index in self.error_dict:
+        #                 gradient.add_(self.error_dict[bucket_index])
+        #             else:
+        #                 logger.info(
+        #                     "A zero tensor of length %s that represents local error is created.",
+        #                     total_length,
+        #                 )
+        #                 self.error_dict[bucket_index] = torch.zeros(
+        #                     total_length, device=gradient.device, dtype=self.dtype
+        #                 )
+        #         my_observer = torch.ao.quantization.MinMaxObserver(dtype=self.dtype).to(gradient.device)
+        #         my_observer(gradient)
+        #
+        #         s, z = my_observer.calculate_qparams()
+        #         s_and_z = torch.FloatTensor([s, z]).to(gradient.device)
+        #         all_ranks_s_and_z = _get_all_gather_out_list(s_and_z, world_size)
+        #         # First, allgather scale and zeros.
+        #         dist.all_gather(
+        #             all_ranks_s_and_z, s_and_z, group=process_group, async_op=True
+        #         )
+        #         self.all_infos.append({
+        #             "gradient": gradient,
+        #         })
+
+
         with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
-            for _, bucket in enumerate(buckets):
+            for bucket in buckets:
                 gradient = bucket.grad_data
                 bucket_index = bucket.bucket_id
                 total_length = gradient.shape[0]
@@ -490,65 +520,55 @@ class GradQuantizationState:
 
                 s, z = my_observer.calculate_qparams()
                 s_and_z = torch.FloatTensor([s, z]).to(gradient.device)
-                all_ranks_s_and_z = _get_all_gather_out_list(s_and_z, world_size)
-                # First, allgather scale and zeros.
-                fut_sz = dist.all_gather(
-                    all_ranks_s_and_z, s_and_z, group=process_group, async_op=True
-                )
-                self.all_infos.append({
-                    "fut": fut_sz,
-                    "gradient": gradient,
-                })
+                s_and_z_dtype = s_and_z.dtype
+                comm_s_and_z = s_and_z.view(self.dtype)
+                s_and_z_size = comm_s_and_z.numel()
 
-        for info in self.all_infos:
-            gradient = info["gradient"]
-            fut_sz = info["fut"]
-            def quantize_and_allgather(fut):
-                # Store scale and zeros across all workers.
-                s_and_z_synced = fut.value()[0]
-                # All workers quantize their own ``GradBucket`` tensors.
                 quantized_gradient = _quantize_per_tensor_backend(
-                    gradient, s_and_z_synced[rank][0], s_and_z_synced[rank][1], self.dtype
+                    gradient, s, z, self.dtype
                 )
-                # Store quantization error in error_dict
+                grad_shape = quantized_gradient.shape
+                comm_gradient = quantized_gradient.flatten()
                 if self.use_error_feedback:
-                    if quantized_gradient is None:
-                        raise AssertionError
-                    self.error_dict[bucket_index] = gradient - quantized_gradient
-                # Allgather quantized tensors.
-                fut_q = dist.all_gather(
-                    _get_all_gather_out_list(quantized_gradient, world_size),
-                    quantized_gradient,
-                    group=process_group,
-                    async_op=True,
-                ).get_future()
-                return fut_q
-
-            def dequantize_and_aggregate(fut):
-                all_ranks_quantized_tensor = fut.value()[0]
-
-                aggregated_dequantized_tensor = torch.zeros_like(
-                    all_ranks_quantized_tensor[0], device=gradient.device, dtype=original_dtype
-                )
-                # Using previously allgathered scales and zeros, dequantize gradient tensors
-                # locally and then aggregate them.
-                for r, quantized_tensor in enumerate(all_ranks_quantized_tensor):
-                    aggregated_dequantized_tensor += _dequantize_per_tensor_backend(
-                        quantized_tensor, all_ranks_s_and_z[r][0], all_ranks_s_and_z[r][1]
+                    self.error_dict[bucket_index] = gradient - _dequantize_per_tensor_backend(
+                        quantized_gradient, s, z, dtype=original_dtype,
                     )
 
-                return aggregated_dequantized_tensor / world_size
+                packed_data = torch.cat([comm_s_and_z, comm_gradient])
 
-            self.all_futs.append(
-                fut_sz.then(quantize_and_allgather).then(dequantize_and_aggregate)
-            )
+                all_packed_data = _get_all_gather_out_list(packed_data, world_size)
+
+                dist.all_gather(
+                    all_packed_data, packed_data, group=process_group, async_op=True
+                )
+
+                self.all_infos[bucket_index] = {
+                    "data": all_packed_data,
+                    "grad_shape": grad_shape,
+                    "s_and_z_dtype": s_and_z_dtype,
+                    "s_and_z_size": s_and_z_size,
+                }
+
+        for bucket in buckets:
+            info = self.all_infos[bucket.bucket_id]
+            all_packed_data = info["data"]
+            grad_shape = info["grad_shape"]
+            s_and_z_size = info["s_and_z_size"]
+            s_and_z_dtype = info["s_and_z_dtype"]
+            s_and_z = all_packed_data[:s_and_z_size].view(s_and_z_dtype)
+            comm_gradient = all_packed_data[s_and_z_size:].view(grad_shape)
+
+            aggregated_grad = torch.zeros(size=grad_shape, dtype=original_dtype, device=comm_gradient.device)
+
+            for i, packed_data in enumerate(all_packed_data):
+                aggregated_grad += _dequantize_per_tensor_backend(
+                    comm_gradient, s_and_z[i][0], s_and_z[i][1], dtype=original_dtype,
+                )
+
+            bucket.grad_data = aggregated_grad
 
     def finish_grad_sync(self):
-        if self.all_futs:
-            return
-        for fut in self.all_futs:
-            fut.wait()
-        self.all_futs = []
+        self.all_infos = {}
 
 
 
