@@ -18,8 +18,9 @@ runs/
 /test_cases/
 **/dist/
 
-/data/
-/tensorboard/
+data/
+tensorboard/
+torch_profile/
 
 # Sphinx documentation
 docs/_build

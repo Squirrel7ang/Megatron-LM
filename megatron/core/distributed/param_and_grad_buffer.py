@@ -586,12 +586,17 @@ class _ParamAndGradBucketGroup:
             # gradient reduction collective.
             self.communication_stream.wait_stream(torch.cuda.current_stream())
         elif (
+            self.ddp_config.use_grad_quantization
+            and self.ddp_config.overlap_grad_reduce
+        ):
+            stream_context = torch.cuda.stream(self.communication_stream)
+            self.communication_stream.wait_stream(torch.cuda.current_stream())
+        elif (
             self.ddp_config.use_arc_topk
             and self.ddp_config.overlap_grad_reduce
         ):
             stream_context = torch.cuda.stream(self.communication_stream)
             self.communication_stream.wait_stream(torch.cuda.current_stream())
-            # logger.info("cuda stream context created")
         else:
             stream_context = nullcontext()
 
@@ -687,7 +692,7 @@ class _ParamAndGradBucketGroup:
                 # collective handle's .wait() method, so we take matters into our own hands here.
                 assert grad_reduce_handle is not None
                 self.grad_reduce_handle = grad_reduce_handle
-            elif self.ddp_config.use_arc_topk:
+            elif self.ddp_config.use_arc_topk or self.ddp_config.use_grad_quantization:
                 self.grad_reduce_handle = None
             else:
                 self.grad_reduce_handle = cm

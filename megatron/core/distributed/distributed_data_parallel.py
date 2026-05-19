@@ -233,7 +233,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         self.inter_dist_opt_group
                     )
                     bucket_group.communication_stream = communication_stream
-            elif self.ddp_config.use_arc_topk:
+            elif self.ddp_config.use_arc_topk or self.ddp_config.use_grad_quantization:
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
                     bucket_group.communication_stream = communication_stream

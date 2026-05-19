@@ -298,8 +298,9 @@ class ArcTopkState:
                 indices = torch.topk(score, k=K).indices
                 
                 comm_gradient = gradient[indices, :]
-                err_gradient = gradient - comm_gradient
-                self.error_dict[bucket.bucket_id] = err_gradient
+                if self.use_error_feedback:
+                    err_gradient = gradient - comm_gradient
+                    self.error_dict[bucket.bucket_id] = err_gradient
                 dist.all_reduce(
                     comm_gradient, group=self.process_group, async_op=async_op
                 )
@@ -521,10 +522,13 @@ class GradQuantizationState:
                         self.error_dict[bucket_index] = torch.zeros(
                             total_length, device=gradient.device, dtype=self.dtype
                         )
-                my_observer = torch.ao.quantization.MinMaxObserver(dtype=self.dtype).to(gradient.device)
-                my_observer(gradient)
 
-                s, z = my_observer.calculate_qparams()
+                d_min, d_max = _get_dtype_range(self.dtype)
+                t_min, t_max = gradient.min(), gradient.max()
+                
+                s = (t_max - t_min) / (d_max - d_min)
+                z = d_min - t_min / s
+
                 s_and_z = torch.FloatTensor([s, z]).to(gradient.device)
                 s_and_z_dtype = s_and_z.dtype
                 comm_s_and_z = s_and_z.view(self.dtype)
@@ -564,20 +568,18 @@ class GradQuantizationState:
             grad_shape = info["grad_shape"]
             s_and_z_size = info["s_and_z_size"]
             s_and_z_dtype = info["s_and_z_dtype"]
-            s_and_z = packed_data_list[:s_and_z_size].view(s_and_z_dtype)
-            comm_gradient = packed_data_list[s_and_z_size:].view(grad_shape)
 
             aggregated_grad = torch.zeros(size=grad_shape, dtype=original_dtype, device=comm_gradient.device)
 
+            self.all_infos[bucket.bucket_id] = None
             for i, packed_data in enumerate(packed_data_list):
+                s_and_z = packed_data[:s_and_z_size].view(s_and_z_dtype)
+                comm_gradient = packed_data[s_and_z_size:].view(grad_shape)
                 aggregated_grad += _dequantize_per_tensor_backend(
-                    comm_gradient, s_and_z[i][0], s_and_z[i][1], dtype=original_dtype,
-                )
-
-            bucket.grad_data = aggregated_grad
+                    comm_gradient, s_and_z[0], s_and_z[1], dtype=original_dtype,
+                ) / world_size
+                packed_data_list[i] = None
+            packed_data_list = None
 
     def finish_grad_sync(self):
         self.all_infos = {}
-
-
-

@@ -14,7 +14,8 @@ CHECKPOINT_PATH=$1 #<Specify path>
 TENSORBOARD_LOGS_PATH="./tensorboard" #<Specify path>
 VOCAB_FILE=$3 #<Specify path to file>/gpt2-vocab.json
 MERGE_FILE=$4 #<Specify path to file>/gpt2-merges.txt
-DATA_PATH="data/wikitext-2/wikitext2_text_document_text_document" #<Specify path and file prefix>_text_document
+# DATA_PATH="data/wikitext-2/wikitext2_text_document_text_document" #<Specify path and file prefix>_text_document
+DATA_PATH="data/wikitext-103/processed/wikitext-103_text_document"
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
@@ -40,7 +41,7 @@ GPT_MODEL_ARGS=(
     # --max-position-embeddings 32768 
     # --seq-length 4096 
 
-    # AI-config
+    # AI-config ~ 1.6B
     # --num-layers 12 
     # --hidden-size 3072 
     # --ffn-hidden-size 12288 
@@ -127,6 +128,9 @@ TRAINING_ARGS=(
     
     # --use-arc-topk
     # --arc-topk-compression-ratio 0.1
+
+    --use-grad-quantization
+    --grad-quantization-dtype int8
 )
 
 MODEL_PARALLEL_ARGS=(
@@ -172,7 +176,7 @@ echo "torchrun ${DISTRIBUTED_ARGS[@]} pretrain_fm9g.py ${GPT_MODEL_ARGS[@]} \
 "
 echo "------------------------------------------------------------"
 
-
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 torchrun ${DISTRIBUTED_ARGS[@]} pretrain_fm9g.py \
     ${GPT_MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
