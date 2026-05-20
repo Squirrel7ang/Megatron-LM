@@ -1,7 +1,6 @@
 import math
 import logging
 from typing import List
-import traceback
 
 import torch
 import torch.distributed as dist
@@ -10,9 +9,14 @@ from torch.distributed import _coalescing_manager
 from .param_and_grad_buffer import _ParamAndGradBucket
 from .overlap_tracker import overlap_tracker
 
+try:
+    from bitscom import LowBitGroup
+except:
+    LowBitGroup = None
+
 _ARC_TOPK_STATE = None
 _GRAD_QUANTIZATION_STATE = None
-
+_GRAD_QUANTIZATION2_STATE = None
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,34 @@ def init_grad_quantization_state(
     return _GRAD_QUANTIZATION_STATE
 
 
+def init_grad_quantization2_state(
+        process_group,
+        use_error_feedback,
+        bitwidth: int = 4,
+        stochastic_rounding: bool = False,
+        block_size: int = 256,
+):
+    """Initialize GradQuantization2State using bitscom library.
+
+    Args:
+        process_group: The process group to use for communication.
+        use_error_feedback: Whether to use error feedback mechanism.
+        bitwidth: Quantization bit width (1, 2, 4, 8, 12, 16).
+        stochastic_rounding: Whether to use stochastic rounding.
+        block_size: Block size for block-wise quantization.
+    """
+    global _GRAD_QUANTIZATION2_STATE
+    if _GRAD_QUANTIZATION2_STATE is None:
+        _GRAD_QUANTIZATION2_STATE = GradQuantization2State(
+            process_group=process_group,
+            use_error_feedback=use_error_feedback,
+            bitwidth=bitwidth,
+            stochastic_rounding=stochastic_rounding,
+            block_size=block_size,
+        )
+    return _GRAD_QUANTIZATION2_STATE
+
+
 def get_arc_topk_state():
     if _ARC_TOPK_STATE is None:
         raise ValueError("ARC-Top-K state is not initialized.")
@@ -61,6 +93,12 @@ def get_grad_quantization_state():
     if _GRAD_QUANTIZATION_STATE is None:
         raise ValueError("Gradient quantization state is not initialized.")
     return _GRAD_QUANTIZATION_STATE
+
+
+def get_grad_quantization2_state():
+    if _GRAD_QUANTIZATION2_STATE is None:
+        raise ValueError("Gradient quantization2 state is not initialized.")
+    return _GRAD_QUANTIZATION2_STATE
 
 
 def _is_integer(dtype: torch.dtype):
@@ -666,3 +704,165 @@ class GradQuantizationState:
 
     def finish_grad_sync(self):
         self.all_infos = {}
+
+
+class GradQuantization2State:
+    """
+    Gradient quantization state using bitscom library.
+    
+    This class wraps bitscom's LowBitGroup to provide low-bit gradient compression
+    with error feedback mechanism, compatible with All-Reduce operations.
+    """
+    __slots__ = [
+        "process_group",
+        "use_error_feedback",
+        "error_dict",
+        "bitwidth",
+        "stochastic_rounding",
+        "block_size",
+        "lowbit_group",
+        "all_infos",
+        "stream_context",
+        "buckets",
+        "cm",
+    ]
+
+    def __init__(
+        self,
+        process_group,
+        use_error_feedback: bool,
+        bitwidth: int = 4,
+        stochastic_rounding: bool = False,
+        block_size: int = 256,
+    ):
+        """
+        Initialize GradQuantization2State.
+        
+        Args:
+            process_group: The process group to use for communication.
+            use_error_feedback: Whether to use error feedback mechanism.
+            bitwidth: Quantization bit width (1, 2, 4, 8, 12, 16).
+            stochastic_rounding: Whether to use stochastic rounding.
+            block_size: Block size for block-wise quantization.
+        """
+        # Import bitscom here to avoid import issues during module loading
+        # self._has_bitscom = False
+        if LowBitGroup is None:
+            logger.warning(f"bitscom library not found")
+
+        self.process_group = process_group
+        self.use_error_feedback = use_error_feedback
+        self.bitwidth = bitwidth
+        self.stochastic_rounding = stochastic_rounding
+        self.block_size = block_size
+        self.error_dict = {}
+        self.all_infos = {}
+        self.stream_context = None
+        self.buckets = []
+        self.cm = None
+        
+        # Initialize LowBitGroup if bitscom is available
+        self.lowbit_group = LowBitGroup(
+            bitwidth=bitwidth,
+            process_group=process_group,
+            stochastic_rounding=stochastic_rounding,
+            block_size=block_size,
+        )
+
+    def start_grad_sync(
+            self,
+            buckets: List[_ParamAndGradBucket],
+            stream_context: torch.cuda.StreamContext,
+            async_op: bool = False
+    ):
+        """
+        Start gradient synchronization using bitscom low-bit All-Reduce.
+        
+        Args:
+            buckets: List of parameter and gradient buckets.
+            stream_context: CUDA stream context for async operations.
+            async_op: Whether to perform asynchronous operations.
+        """
+
+        process_group = self.process_group
+        rank = process_group.rank() if process_group is not None else dist.get_rank()
+        world_size = process_group.size()
+        
+        self.stream_context = stream_context
+        self.buckets = buckets
+        
+        with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
+            for bucket in buckets:
+                gradient = bucket.grad_data
+                bucket_index = bucket.bucket_id
+                
+                # Apply error feedback if enabled
+                if self.use_error_feedback:
+                    if bucket_index in self.error_dict:
+                        gradient.add_(self.error_dict[bucket_index])
+                    else:
+                        logger.info(
+                            "A zero tensor of length %s that represents local error is created.",
+                            gradient.numel(),
+                        )
+                        self.error_dict[bucket_index] = torch.zeros(
+                            gradient.shape,
+                            device=gradient.device,
+                            dtype=gradient.dtype
+                        )
+                
+                # Store original gradient for error calculation
+                original_grad = gradient.clone() if self.use_error_feedback else None
+                
+                # Start GPU communication tracking
+                overlap_tracker.start_gpu_communication()
+                
+                # Use bitscom's low-bit all_reduce
+                self.lowbit_group.all_reduce(
+                    gradient,
+                    op=dist.ReduceOp.SUM,
+                    async_op=async_op,
+                )
+                
+                # Stop GPU communication tracking
+                overlap_tracker.stop_gpu_communication()
+                
+                # Calculate error for feedback
+                if self.use_error_feedback:
+                    # Error = original - (reduced / world_size)
+                    reduced_avg = gradient / world_size
+                    self.error_dict[bucket_index] = original_grad - reduced_avg
+                
+                # Store info for finish_grad_sync
+                self.all_infos[bucket_index] = {
+                    "gradient": gradient,
+                    "world_size": world_size,
+                }
+        
+        self.cm = cm
+
+    def finish_grad_sync(self):
+        """
+        Finalize gradient synchronization.
+        
+        Averages the reduced gradients by world_size.
+        """
+        if self.stream_context is None:
+            return
+        
+        with self.stream_context:
+            if self.cm is not None:
+                self.cm.wait()
+            
+            for bucket in self.buckets:
+                info = self.all_infos.get(bucket.bucket_id)
+                if info is not None:
+                    gradient = info["gradient"]
+                    world_size = info["world_size"]
+                    gradient.div_(world_size)
+        
+        # Clean up
+        self.all_infos = {}
+        self.stream_context = None
+        self.buckets = []
+        self.cm = None
