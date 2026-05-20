@@ -1471,7 +1471,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['use_arc_topk'] = args.use_arc_topk
             kwargs['arc_topk_priority_rank'] = args.arc_topk_priority_rank
             kwargs['adjust_compression_ratio'] = args.adjust_compression_ratio
-            assert 0 < args.arc_topk_compression_ratio < 1, \
+            assert 0 < args.arc_topk_compression_ratio <= 1, \
                 "--arc-topk-compression-ratio must be between 0 and 1"
             kwargs['arc_topk_compression_ratio'] = args.arc_topk_compression_ratio
             kwargs['use_grad_quantization'] = args.use_grad_quantization

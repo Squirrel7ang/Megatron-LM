@@ -636,20 +636,22 @@ class _ParamAndGradBucketGroup:
             with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
                 for idx, bucket in enumerate(self.buckets):
                     if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
-                        if self.cached_grad_buffer_shard_list[idx] is None:
-                            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                                bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                            )
-                        local_data_view = self.cached_grad_buffer_shard_list[idx][
-                            self.intra_distributed_optimizer_instance_rank
-                        ]
-                        overlap_tracker.start_gpu_communication()
-                        grad_reduce_handle = dist_reduce_scatter_func(
-                            local_data_view,
-                            bucket.grad_data,
-                            op=reduce_op,
-                            group=communication_group,
-                            async_op=async_op,
+                        # if self.cached_grad_buffer_shard_list[idx] is None:
+                        #     self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                        #         bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        #     )
+                        # local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        #     self.intra_distributed_optimizer_instance_rank
+                        # ]
+                        # grad_reduce_handle = dist_reduce_scatter_func(
+                        #     local_data_view,
+                        #     bucket.grad_data,
+                        #     op=reduce_op,
+                        #     group=communication_group,
+                        #     async_op=async_op,
+                        # )
+                        torch.distributed.all_reduce(
+                            bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                         )
                         overlap_tracker.stop_gpu_communication()
                     else:

@@ -374,8 +374,12 @@ class ArcTopkState:
 
                 # 在 Megatron 中使用 bucket.grad_data 代替 bucket.buffer()
                 gradient = bucket.grad_data
-                if self.use_error_feedback and self.error_dict[bucket.bucket_id] is not None:
-                    gradient += self.error_dict[bucket.bucket_id]
+                if (
+                    self.use_error_feedback
+                    and bucket.bucket_id in self.error_dict
+                    and self.error_dict[bucket.bucket_id] is not None
+                ):
+                    gradient += self.error_dict[bucket.bucket_id].to(gradient.device).view(gradient.shape)
                 d = gradient.numel()
                 row_num = _cal_max_factor(d)
                 gradient = gradient.view(-1, row_num)
@@ -414,12 +418,14 @@ class ArcTopkState:
                 score = (P * P).sum(dim=1)
                 col_num = d / row_num
                 K = max(1, int(col_num * self.compression_ratio))
-                indices = torch.topk(score, k=K).indices
+                indices = torch.topk(score, k=K).indices.sort().values
                 
                 comm_gradient = gradient[indices, :]
                 if self.use_error_feedback:
-                    err_gradient = gradient - comm_gradient
-                    self.error_dict[bucket.bucket_id] = err_gradient
+                    err_gradient = gradient.clone()
+                    err_gradient[indices, :] = 0
+                    err_gradient = gradient - err_gradient
+                    self.error_dict[bucket.bucket_id] = err_gradient.to('cpu')
                 overlap_tracker.start_gpu_communication()
                 dist.all_reduce(
                     comm_gradient, group=self.process_group, async_op=async_op
