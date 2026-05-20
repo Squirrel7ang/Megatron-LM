@@ -418,14 +418,16 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    overlap_tracker.start_gpu_communication()
+                    if self.ddp_config.adjust_compression_ratio:
+                        overlap_tracker.start_gpu_communication()
                     dist_all_gather_func(
                         bucket.param_data,
                         local_data_view,
                         group=self.intra_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
-                    overlap_tracker.stop_gpu_communication()
+                    if self.ddp_config.adjust_compression_ratio:
+                        overlap_tracker.stop_gpu_communication()
             if async_op:
                 self.param_gather_handle = cm
             else:
@@ -623,14 +625,14 @@ class _ParamAndGradBucketGroup:
             state = get_arc_topk_state()
             state.start_grad_sync(self.buckets, stream_context, async_op)
         elif self.ddp_config.use_grad_quantization and not force_all_reduce:
-            from .grad_compression import init_grad_quantization_state, get_grad_quantization_state
-            init_grad_quantization_state(
+            from .grad_compression import init_grad_quantization2_state, get_grad_quantization2_state
+            init_grad_quantization2_state(
                 communication_group,
                 self.ddp_config.use_error_feedback,
-                self.ddp_config.grad_quantization_dtype,
-                False,
+                bitwidth=8,
+                stochastic_rounding=False,
             )
-            state = get_grad_quantization_state()
+            state = get_grad_quantization2_state()
             state.start_grad_sync(self.buckets, stream_context, async_op)
         else:
             with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
@@ -653,17 +655,20 @@ class _ParamAndGradBucketGroup:
                         torch.distributed.all_reduce(
                             bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                         )
-                        overlap_tracker.stop_gpu_communication()
+                        if self.ddp_config.adjust_compression_ratio:
+                            overlap_tracker.stop_gpu_communication()
                     else:
                         if torch.distributed.get_rank() == 0 and force_all_reduce:
                             logger.info(
                                 f"Performing reduction using all_reduce because {force_all_reduce=}"
                             )
-                        overlap_tracker.start_gpu_communication()
+                        if self.ddp_config.adjust_compression_ratio:
+                            overlap_tracker.start_gpu_communication()
                         torch.distributed.all_reduce(
                             bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                         )
-                        overlap_tracker.stop_gpu_communication()
+                        if self.ddp_config.adjust_compression_ratio:
+                            overlap_tracker.stop_gpu_communication()
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
@@ -686,14 +691,16 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    overlap_tracker.start_gpu_communication()
+                    if self.ddp_config.adjust_compression_ratio:
+                        overlap_tracker.start_gpu_communication()
                     torch.distributed.all_reduce(
                         local_data_view,
                         op=reduce_op,
                         group=self.inter_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
-                    overlap_tracker.stop_gpu_communication()
+                    if self.ddp_config.adjust_compression_ratio:
+                        overlap_tracker.stop_gpu_communication()
 
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
@@ -746,8 +753,8 @@ class _ParamAndGradBucketGroup:
             self._copy_back_extra_main_grads()
             return
         if self.ddp_config.use_grad_quantization:
-            from .grad_compression import get_grad_quantization_state
-            state = get_grad_quantization_state()
+            from .grad_compression import get_grad_quantization2_state
+            state = get_grad_quantization2_state()
             state.finish_grad_sync()
             self.grad_reduce_handle = None
             self._copy_back_extra_main_grads()
@@ -1027,9 +1034,11 @@ class _ParamAndGradBuffer:
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
             torch.distributed.barrier()
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
-            overlap_tracker.start_gpu_communication()
+            if self.ddp_config.adjust_compression_ratio:
+                overlap_tracker.start_gpu_communication()
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
-            overlap_tracker.stop_gpu_communication()
+            if self.ddp_config.adjust_compression_ratio:
+                overlap_tracker.stop_gpu_communication()
             torch.distributed.barrier()
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.

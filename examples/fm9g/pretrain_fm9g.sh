@@ -110,7 +110,7 @@ TRAINING_ARGS=(
     --lr-decay-style cosine 
     --lr-warmup-fraction 0.02 
     --bf16
-    --train-iters 30
+    --train-iters 1000
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
@@ -145,7 +145,7 @@ DATA_ARGS=(
     --data-path $DATA_PATH 
     # --vocab-file $VOCAB_FILE 
     # --merge-file $MERGE_FILE 
-    # --split 949,50,1
+    --split 949,50,1
 )
 
 PROFILING_ARGS=(
@@ -159,7 +159,7 @@ PROFILING_ARGS=(
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 10000 
-    --eval-interval 1000 
+    --eval-interval 100 
     # --save $CHECKPOINT_PATH 
     # --load $CHECKPOINT_PATH 
     --eval-iters 10

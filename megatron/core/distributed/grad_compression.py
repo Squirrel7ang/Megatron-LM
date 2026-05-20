@@ -319,7 +319,8 @@ class ArcTopkState:
         buckets: List[_ParamAndGradBucket],
         stream_context,
         # stream_context: torch.cuda.StreamContext,
-        async_op: bool = False
+        async_op: bool = False,
+        adjust_compression_ratio: bool = False,
     ):
         self._adjust_compression_ratio()
         r"""
@@ -389,11 +390,13 @@ class ArcTopkState:
                 P = torch.matmul(gradient, V) / math.sqrt(self.priority_rank)
                 
                 # 发起第一次 All-Reduce
-                overlap_tracker.start_gpu_communication()
+                if adjust_compression_ratio:
+                    overlap_tracker.start_gpu_communication()
                 dist.all_reduce(
                     P, group=self.process_group, async_op=async_op
                 )
-                overlap_tracker.stop_gpu_communication()
+                if adjust_compression_ratio:
+                    overlap_tracker.stop_gpu_communication()
                 self.infos[bucket.bucket_id] = {
                     "gradient": gradient,
                     "P": P,
@@ -426,11 +429,14 @@ class ArcTopkState:
                     err_gradient[indices, :] = 0
                     err_gradient = gradient - err_gradient
                     self.error_dict[bucket.bucket_id] = err_gradient.to('cpu')
-                overlap_tracker.start_gpu_communication()
+                    
+                if adjust_compression_ratio:
+                    overlap_tracker.start_gpu_communication()
                 dist.all_reduce(
                     comm_gradient, group=self.process_group, async_op=async_op
                 )
-                overlap_tracker.stop_gpu_communication()
+                if adjust_compression_ratio:
+                    overlap_tracker.stop_gpu_communication()
                 self.infos[bucket.bucket_id]["comm_gradient"] = comm_gradient
                 self.infos[bucket.bucket_id]["indices"] = indices
                 
@@ -577,7 +583,8 @@ class GradQuantizationState:
             self,
             buckets: List[_ParamAndGradBucket],
             stream_context: torch.cuda.StreamContext,
-            async_op: bool = False
+            async_op: bool = False,
+            adjust_compression_ratio: bool = False,
     ):
         def _get_all_gather_out_list(tensor, world_size):
             shape = (world_size,) + tensor.shape
@@ -779,7 +786,8 @@ class GradQuantization2State:
             self,
             buckets: List[_ParamAndGradBucket],
             stream_context: torch.cuda.StreamContext,
-            async_op: bool = False
+            async_op: bool = False,
+            adjust_compression_ratio: bool = False,
     ):
         """
         Start gradient synchronization using bitscom low-bit All-Reduce.
@@ -821,17 +829,19 @@ class GradQuantization2State:
                 original_grad = gradient.clone() if self.use_error_feedback else None
                 
                 # Start GPU communication tracking
-                overlap_tracker.start_gpu_communication()
+                if adjust_compression_ratio:
+                    overlap_tracker.start_gpu_communication()
                 
                 # Use bitscom's low-bit all_reduce
-                self.lowbit_group.all_reduce(
-                    gradient,
-                    op=dist.ReduceOp.SUM,
-                    async_op=async_op,
-                )
+                    self.lowbit_group.all_reduce(
+                        gradient,
+                        op=dist.ReduceOp.SUM,
+                        async_op=async_op,
+                    )
                 
                 # Stop GPU communication tracking
-                overlap_tracker.stop_gpu_communication()
+                if adjust_compression_ratio:
+                    overlap_tracker.stop_gpu_communication()
                 
                 # Calculate error for feedback
                 if self.use_error_feedback:
