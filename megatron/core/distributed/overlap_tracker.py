@@ -1,9 +1,3 @@
-"""OverlapTracker - 单例模式的时间跟踪器
-
-用于记录和统计 GPU 计算时间、CPU 计算时间和 GPU 通信时间，
-支持在线监控通信-计算重叠率。
-"""
-
 import logging
 import torch
 import time
@@ -13,46 +7,7 @@ from typing import Optional, Dict, List, Callable
 logger = logging.getLogger(__name__)
 
 class OverlapTracker:
-    """单例模式的时间跟踪器
-    
-    记录三类时间：
-    - GPU 计算时间：GPU 上所有计算 kernels 的执行时间
-    - CPU 计算时间：CPU 上的计算时间（不含同步等待）
-    - GPU 通信时间：GPU 通信 stream 上的通信操作时间
-    
-    使用示例：
-        tracker = OverlapTracker()
-        
-        # 记录 GPU 计算时间
-        with tracker.record_gpu_compute():
-            # GPU 计算操作
-            output = model(input)
-        
-        # 记录 CPU 计算时间
-        with tracker.record_cpu_compute():
-            # CPU 计算操作
-            process_data()
-        
-        # 记录 GPU 通信时间
-        with tracker.record_gpu_communication():
-            # 通信操作
-            dist.all_reduce(tensor)
-        
-        # 获取统计信息
-        stats = tracker.get_stats()
-        print(f"重叠率: {stats['overlap_ratio']:.2%}")
-    """
-    
-    _instance: Optional['OverlapTracker'] = None
     _lock: threading.Lock = threading.Lock()
-    
-    def __new__(cls):
-        """单例模式实现"""
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-                cls._instance._initialized = False
-        return cls._instance
     
     def __init__(self) -> None:
         """初始化跟踪器（线程安全）"""
@@ -101,9 +56,10 @@ class OverlapTracker:
     # ==================== 上下文管理器（推荐用法） ====================
 
     def start_recording(self):
-        self._record_start_time()
-        self._start_mock_cpu_cuda_synchronize()
-        self.start_cpu_compute()
+        with self._lock:
+            self._record_start_time()
+            self._start_mock_cpu_cuda_synchronize()
+            self.start_cpu_compute()
 
 
     def _record_start_time(self):
@@ -112,9 +68,10 @@ class OverlapTracker:
         self._cpu_anchor_time = time.time()
 
     def stop_recording(self):
-        self.stats = self._cal_stats()
-        self._stop_mock_cpu_cuda_synchronize()
-        self._reset()
+        with self._lock:
+            self.stats = self._cal_stats()
+            self._stop_mock_cpu_cuda_synchronize()
+            self._reset()
 
     # ==================== CPU ====================
 
@@ -132,31 +89,33 @@ class OverlapTracker:
 
     def start_cpu_compute(self) -> float:
         """开始记录 CPU 计算时间"""
-        if self._is_recording_cpu:
-            raise RuntimeError("CPU compute recording is already in progress")
+        with self._lock:
+            if self._is_recording_cpu:
+                raise RuntimeError("CPU compute recording is already in progress")
 
-        self._cpu_start_time = time.time()
-        self._is_recording_cpu = True
-        return self._cpu_start_time
+            self._cpu_start_time = time.time()
+            self._is_recording_cpu = True
+            return self._cpu_start_time
 
-    def end_cpu_compute(self) -> float:
+    def stop_cpu_compute(self) -> float:
         """结束记录 CPU 计算时间，返回本次记录的时间（毫秒）"""
-        if not self._is_recording_cpu:
-            raise RuntimeError("CPU compute recording is not in progress")
-        self._cpu_end_time = time.time()
+        with self._lock:
+            if not self._is_recording_cpu:
+                raise RuntimeError("CPU compute recording is not in progress")
+            self._cpu_end_time = time.time()
 
-        # 记录 CPU 计算区间（起始时间，终止时间，单位：秒，相对于迭代锚点）
-        self._cpu_compute_events.append((
-            self._cpu_start_time - self._cpu_anchor_time,
-            self._cpu_end_time - self._cpu_anchor_time
-        ))
+            # 记录 CPU 计算区间（起始时间，终止时间，单位：秒，相对于迭代锚点）
+            self._cpu_compute_events.append((
+                self._cpu_start_time - self._cpu_anchor_time,
+                self._cpu_end_time - self._cpu_anchor_time
+            ))
 
-        elapsed_ms = (self._cpu_end_time - self._cpu_start_time) * 1000
-        self._cpu_compute_time += elapsed_ms
-        self._cpu_compute_count += 1
-        self._is_recording_cpu = False
+            elapsed_ms = (self._cpu_end_time - self._cpu_start_time) * 1000
+            self._cpu_compute_time += elapsed_ms
+            self._cpu_compute_count += 1
+            self._is_recording_cpu = False
 
-        return elapsed_ms
+            return elapsed_ms
 
 
     # ==================== Comm ====================
@@ -167,15 +126,16 @@ class OverlapTracker:
         Args:
             stream: 通信使用的 CUDA stream，默认为当前 stream
         """
-        if self._is_recording_comm:
-            raise RuntimeError("GPU communication recording is already in progress")
+        with self._lock:
+            if self._is_recording_comm:
+                raise RuntimeError("GPU communication recording is already in progress")
 
-        if self._gpu_communication_start_event is None:
-            self._gpu_communication_start_event = torch.cuda.Event(enable_timing=True)
+            if self._gpu_communication_start_event is None:
+                self._gpu_communication_start_event = torch.cuda.Event(enable_timing=True)
 
-        target_stream = stream if stream is not None else torch.cuda.current_stream()
-        self._gpu_communication_start_event.record(target_stream)
-        self._is_recording_comm = True
+            target_stream = stream if stream is not None else torch.cuda.current_stream()
+            self._gpu_communication_start_event.record(target_stream)
+            self._is_recording_comm = True
 
     def stop_gpu_communication(self, stream: Optional[torch.cuda.Stream] = None) -> float:
         """结束记录 GPU 通信时间，返回本次记录的时间（毫秒）
@@ -183,30 +143,30 @@ class OverlapTracker:
         Args:
             stream: 通信使用的 CUDA stream，需与 start_gpu_communication 一致
         """
-        if not self._is_recording_comm:
-            raise RuntimeError("GPU communication recording is not in progress")
+        with self._lock:
+            if not self._is_recording_comm:
+                raise RuntimeError("GPU communication recording is not in progress")
 
-        if self._gpu_communication_end_event is None:
-            self._gpu_communication_end_event = torch.cuda.Event(enable_timing=True)
+            if self._gpu_communication_end_event is None:
+                self._gpu_communication_end_event = torch.cuda.Event(enable_timing=True)
 
-        target_stream = stream if stream is not None else torch.cuda.current_stream()
-        self._gpu_communication_end_event.record(target_stream)
-        self._gpu_communication_end_event.synchronize()
+            target_stream = stream if stream is not None else torch.cuda.current_stream()
+            self._gpu_communication_end_event.record(target_stream)
+            self._gpu_communication_end_event.synchronize()
 
-        elapsed_ms = self._gpu_communication_start_event.elapsed_time(self._gpu_communication_end_event)
-        
-        # 记录 GPU 通信区间（起始时间，终止时间，单位：秒，相对于迭代锚点）
-        start_time = self._iteration_anchor.elapsed_time(self._gpu_communication_start_event) / 1000
-        end_time = start_time + elapsed_ms / 1000
-        self._gpu_communication_events.append((start_time, end_time))
-        
-        self._gpu_communication_time += elapsed_ms
-        self._gpu_communication_count += 1
-        self._is_recording_comm = False
+            elapsed_ms = self._gpu_communication_start_event.elapsed_time(self._gpu_communication_end_event)
 
-        return elapsed_ms
+            # 记录 GPU 通信区间（起始时间，终止时间，单位：秒，相对于迭代锚点）
+            start_time = self._iteration_anchor.elapsed_time(self._gpu_communication_start_event) / 1000
+            end_time = start_time + elapsed_ms / 1000
+            self._gpu_communication_events.append((start_time, end_time))
 
-    
+            self._gpu_communication_time += elapsed_ms
+            self._gpu_communication_count += 1
+            self._is_recording_comm = False
+
+            return elapsed_ms
+
     # def start_gpu_compute(self) -> None:
     #     """开始记录 GPU 计算时间"""
     #     if self._is_recording_gpu:
@@ -309,7 +269,8 @@ class OverlapTracker:
         }
 
     def get_overlap_ratio(self):
-        return self.stats['overlap_ratio']
+        with self._lock:
+            return self.stats['overlap_ratio']
     
     def _reset(self) -> None:
         """重置所有计时器和计数器"""
@@ -322,7 +283,7 @@ class OverlapTracker:
         self._cpu_compute_events.clear()
         self._gpu_communication_events.clear()
         try:
-            self.end_cpu_compute()
+            self.stop_cpu_compute()
         finally:
             pass
         try:
@@ -331,79 +292,22 @@ class OverlapTracker:
             pass
 
     def step(self):
-        self.stats = self._cal_stats()
-        self._reset()
+        with self._lock:
+            self.stats = self._cal_stats()
+            self._reset()
     
     def __str__(self) -> str:
         """返回可读的统计信息字符串"""
-        stats = self._cal_stats()
-        return (
-            f"OverlapTracker Statistics:\n"
-            f"  GPU Compute Time: {stats['gpu_compute_time_ms']:.2f} ms ({stats['gpu_compute_count']} calls)\n"
-            f"  CPU Compute Time: {stats['cpu_compute_time_ms']:.2f} ms ({stats['cpu_compute_count']} calls)\n"
-            f"  GPU Comm Time: {stats['gpu_communication_time_ms']:.2f} ms ({stats['gpu_communication_count']} calls)\n"
-            f"  Total Compute Time: {stats['total_compute_time_ms']:.2f} ms\n"
-            f"  Overlap Ratio: {stats['overlap_ratio']:.2%}"
-        )
-    
-    # ==================== 上下文管理器内部类 ====================
-
-    # def record_cpu_compute(self) -> 'OverlapTracker._CPUComputeContext':
-    #     """返回一个上下文管理器，用于记录 CPU 计算时间"""
-    #     return self._CPUComputeContext(self)
-    #
-    # def record_gpu_compute(self) -> 'OverlapTracker._GPUComputeContext':
-    #     """返回一个上下文管理器，用于记录 GPU 计算时间"""
-    #     return self._GPUComputeContext(self)
-    #
-    # def record_gpu_communication(self) -> 'OverlapTracker._GPUCommContext':
-    #     """返回一个上下文管理器，用于记录 GPU 通信时间"""
-    #     return self._GPUCommContext(self)
-    #
-    # class _GPUComputeContext:
-    #     """GPU 计算时间记录上下文管理器"""
-    #
-    #     def __init__(self, tracker: 'OverlapTracker') -> None:
-    #         self._tracker = tracker
-    #
-    #     def __enter__(self) -> None:
-    #         self._tracker.start_gpu_compute()
-    #
-    #     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-    #         if exc_type is None:
-    #             self._tracker.end_gpu_compute()
-    #
-    # class _CPUComputeContext:
-    #     """CPU 计算时间记录上下文管理器"""
-    #
-    #     def __init__(self, tracker: 'OverlapTracker') -> None:
-    #         self._tracker = tracker
-    #
-    #     def __enter__(self) -> None:
-    #         self._tracker.start_cpu_compute()
-    #
-    #     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-    #         if exc_type is None:
-    #             self._tracker.end_cpu_compute()
-    #
-    # class _GPUCommContext:
-    #     """GPU 通信时间记录上下文管理器"""
-    #
-    #     def __init__(self, tracker: 'OverlapTracker') -> None:
-    #         self._tracker = tracker
-    #         self._stream: Optional[torch.cuda.Stream] = None
-    #
-    #     def __enter__(self) -> None:
-    #         self._tracker.start_gpu_communication(self._stream)
-    #
-    #     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-    #         if exc_type is None:
-    #             self._tracker.end_gpu_communication(self._stream)
-    #
-    #     def on_stream(self, stream: torch.cuda.Stream) -> '_GPUCommContext':
-    #         """指定通信使用的 CUDA stream"""
-    #         self._stream = stream
-    #         return self
+        with self._lock:
+            stats = self._cal_stats()
+            return (
+                f"OverlapTracker Statistics:\n"
+                f"  GPU Compute Time: {stats['gpu_compute_time_ms']:.2f} ms ({stats['gpu_compute_count']} calls)\n"
+                f"  CPU Compute Time: {stats['cpu_compute_time_ms']:.2f} ms ({stats['cpu_compute_count']} calls)\n"
+                f"  GPU Comm Time: {stats['gpu_communication_time_ms']:.2f} ms ({stats['gpu_communication_count']} calls)\n"
+                f"  Total Compute Time: {stats['total_compute_time_ms']:.2f} ms\n"
+                f"  Overlap Ratio: {stats['overlap_ratio']:.2%}"
+            )
 
 
 # 创建全局实例
@@ -421,12 +325,11 @@ def _tracked_cuda_synchronize():
         raise RuntimeError("CUDA synchronize tracking not started!")
 
 
-    overlap_tracker.stop_gpu_communication()
+    overlap_tracker.stop_cpu_compute()
     overlap_tracker.origin_cpu_cuda_synchronize()
     overlap_tracker.start_cpu_compute()
 
 
-# 便捷函数
 def get_overlap_tracker() -> OverlapTracker:
     """获取全局 OverlapTracker 实例"""
     return overlap_tracker
