@@ -804,56 +804,114 @@ class GradQuantization2State:
         
         self.stream_context = stream_context
         self.buckets = buckets
-        
-        with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
-            for bucket in buckets:
-                gradient = bucket.grad_data
-                bucket_index = bucket.bucket_id
-                
-                # Apply error feedback if enabled
-                if self.use_error_feedback:
-                    if bucket_index in self.error_dict:
-                        gradient.add_(self.error_dict[bucket_index])
-                    else:
-                        logger.info(
-                            "A zero tensor of length %s that represents local error is created.",
-                            gradient.numel(),
-                        )
-                        self.error_dict[bucket_index] = torch.zeros(
-                            gradient.shape,
-                            device=gradient.device,
-                            dtype=gradient.dtype
-                        )
-                
-                # Store original gradient for error calculation
-                original_grad = gradient.clone() if self.use_error_feedback else None
-                
-                # Start GPU communication tracking
-                if adjust_compression_ratio:
-                    overlap_tracker.start_gpu_communication()
-                
-                # Use bitscom's low-bit all_reduce
-                    self.lowbit_group.all_reduce(
-                        gradient,
-                        op=dist.ReduceOp.SUM,
-                        async_op=async_op,
+
+        def sync_bucket(
+                b,
+        ):
+            gradient = b.grad_data
+            bucket_index = b.bucket_id
+
+            # Apply error feedback if enabled
+            if self.use_error_feedback:
+                if bucket_index in self.error_dict:
+                    gradient.add_(self.error_dict[bucket_index])
+                else:
+                    logger.info(
+                        "A zero tensor of length %s that represents local error is created.",
+                        gradient.numel(),
                     )
-                
-                # Stop GPU communication tracking
-                if adjust_compression_ratio:
-                    overlap_tracker.stop_gpu_communication()
-                
-                # Calculate error for feedback
-                if self.use_error_feedback:
-                    # Error = original - (reduced / world_size)
-                    reduced_avg = gradient / world_size
-                    self.error_dict[bucket_index] = original_grad - reduced_avg
-                
-                # Store info for finish_grad_sync
-                self.all_infos[bucket_index] = {
-                    "gradient": gradient,
-                    "world_size": world_size,
-                }
+                    self.error_dict[bucket_index] = torch.zeros(
+                        gradient.shape,
+                        device=gradient.device,
+                        dtype=gradient.dtype
+                    )
+
+            # Store original gradient for error calculation
+            original_grad = gradient.clone() if self.use_error_feedback else None
+
+            # Start GPU communication tracking
+            if adjust_compression_ratio:
+                overlap_tracker.start_gpu_communication()
+
+                # Use bitscom's low-bit all_reduce
+                self.lowbit_group.all_reduce(
+                    gradient,
+                    op=dist.ReduceOp.SUM,
+                    async_op=async_op,
+                )
+
+            # Stop GPU communication tracking
+            if adjust_compression_ratio:
+                overlap_tracker.stop_gpu_communication()
+
+            # Calculate error for feedback
+            if self.use_error_feedback:
+                # Error = original - (reduced / world_size)
+                reduced_avg = gradient / world_size
+                self.error_dict[bucket_index] = original_grad - reduced_avg
+
+            # Store info for finish_grad_sync
+            self.all_infos[bucket_index] = {
+                "gradient": gradient,
+                "world_size": world_size,
+            }
+            pass
+
+        if self.bitwidth >= 8:
+            with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
+                for bucket in buckets:
+                    sync_bucket(bucket)
+        else:
+            with stream_context:
+                for bucket in buckets:
+                    sync_bucket(bucket)
+                # gradient = bucket.grad_data
+                # bucket_index = bucket.bucket_id
+                #
+                # # Apply error feedback if enabled
+                # if self.use_error_feedback:
+                #     if bucket_index in self.error_dict:
+                #         gradient.add_(self.error_dict[bucket_index])
+                #     else:
+                #         logger.info(
+                #             "A zero tensor of length %s that represents local error is created.",
+                #             gradient.numel(),
+                #         )
+                #         self.error_dict[bucket_index] = torch.zeros(
+                #             gradient.shape,
+                #             device=gradient.device,
+                #             dtype=gradient.dtype
+                #         )
+                #
+                # # Store original gradient for error calculation
+                # original_grad = gradient.clone() if self.use_error_feedback else None
+                #
+                # # Start GPU communication tracking
+                # if adjust_compression_ratio:
+                #     overlap_tracker.start_gpu_communication()
+                #
+                # # Use bitscom's low-bit all_reduce
+                #     self.lowbit_group.all_reduce(
+                #         gradient,
+                #         op=dist.ReduceOp.SUM,
+                #         async_op=async_op,
+                #     )
+                #
+                # # Stop GPU communication tracking
+                # if adjust_compression_ratio:
+                #     overlap_tracker.stop_gpu_communication()
+                #
+                # # Calculate error for feedback
+                # if self.use_error_feedback:
+                #     # Error = original - (reduced / world_size)
+                #     reduced_avg = gradient / world_size
+                #     self.error_dict[bucket_index] = original_grad - reduced_avg
+                #
+                # # Store info for finish_grad_sync
+                # self.all_infos[bucket_index] = {
+                #     "gradient": gradient,
+                #     "world_size": world_size,
+                # }
         
         self.cm = cm
 
