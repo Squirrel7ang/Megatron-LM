@@ -1470,6 +1470,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
             kwargs['use_arc_topk'] = args.use_arc_topk
             kwargs['arc_topk_priority_rank'] = args.arc_topk_priority_rank
+            kwargs['adjust_compression_ratio'] = args.adjust_compression_ratio
             assert 0 < args.arc_topk_compression_ratio < 1, \
                 "--arc-topk-compression-ratio must be between 0 and 1"
             kwargs['arc_topk_compression_ratio'] = args.arc_topk_compression_ratio
@@ -2900,6 +2901,10 @@ def train(
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
+        if args.adjust_compression_ratio:
+            from megatron.core.distributed.overlap_tracker import get_overlap_tracker
+            overlap_tracker = get_overlap_tracker()
+            overlap_tracker.start_recording()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
@@ -3032,7 +3037,11 @@ def train(
                 train_data_iterator=train_data_iterator,
             )
         if should_exit:
+            if args.adjust_compression_ratio:
+                overlap_tracker.stop_recording()
             break
+        if args.adjust_compression_ratio:
+            overlap_tracker.stop_recording()
 
         # Enable forward pre-hooks after first set of forward and backward passes.
         # When running in fp16, skip all NaN iterations until steady-state loss scaling value
@@ -3220,7 +3229,14 @@ def train(
             train_data_iterator,
         )
         if should_exit:
+            if args.adjust_compression_ratio:
+                overlap_tracker.stop_recording()
             break
+        if args.adjust_compression_ratio:
+            overlap_tracker.step()
+
+    if args.adjust_compression_ratio:
+        overlap_tracker.stop_recording()
 
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():

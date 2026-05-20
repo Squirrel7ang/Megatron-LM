@@ -29,6 +29,7 @@ from ..fp8_utils import (
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
+from .overlap_tracker import overlap_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -376,9 +377,11 @@ class _ParamAndGradBucketGroup:
                         )
                 bucket.layerwise_gather_list = gather_list
 
+                overlap_tracker.start_gpu_communication()
                 work = torch.distributed.all_gather(
                     gather_list, flat_local_params, group=group, async_op=async_op
                 )
+                overlap_tracker.stop_gpu_communication()
                 if async_op and work is not None:
                     layerwise_work_handles.append(work)
 
@@ -415,12 +418,14 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
+                    overlap_tracker.start_gpu_communication()
                     dist_all_gather_func(
                         bucket.param_data,
                         local_data_view,
                         group=self.intra_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
+                    overlap_tracker.stop_gpu_communication()
             if async_op:
                 self.param_gather_handle = cm
             else:
@@ -638,6 +643,7 @@ class _ParamAndGradBucketGroup:
                         local_data_view = self.cached_grad_buffer_shard_list[idx][
                             self.intra_distributed_optimizer_instance_rank
                         ]
+                        overlap_tracker.start_gpu_communication()
                         grad_reduce_handle = dist_reduce_scatter_func(
                             local_data_view,
                             bucket.grad_data,
@@ -645,14 +651,17 @@ class _ParamAndGradBucketGroup:
                             group=communication_group,
                             async_op=async_op,
                         )
+                        overlap_tracker.stop_gpu_communication()
                     else:
                         if torch.distributed.get_rank() == 0 and force_all_reduce:
                             logger.info(
                                 f"Performing reduction using all_reduce because {force_all_reduce=}"
                             )
+                        overlap_tracker.start_gpu_communication()
                         torch.distributed.all_reduce(
                             bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                         )
+                        overlap_tracker.stop_gpu_communication()
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
@@ -675,13 +684,14 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-
+                    overlap_tracker.start_gpu_communication()
                     torch.distributed.all_reduce(
                         local_data_view,
                         op=reduce_op,
                         group=self.inter_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
+                    overlap_tracker.stop_gpu_communication()
 
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
@@ -1015,7 +1025,9 @@ class _ParamAndGradBuffer:
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
             torch.distributed.barrier()
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
+            overlap_tracker.start_gpu_communication()
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+            overlap_tracker.stop_gpu_communication()
             torch.distributed.barrier()
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.

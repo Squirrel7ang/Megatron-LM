@@ -217,6 +217,8 @@ class DistributedDataParallelConfig:
       FP8, INT8
     """
 
+    adjust_compression_ratio: bool = False
+
     def __post_init__(self):
         import os
 

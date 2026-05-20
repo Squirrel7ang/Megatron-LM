@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.distributed import _coalescing_manager
 
 from .param_and_grad_buffer import _ParamAndGradBucket
+from .overlap_tracker import overlap_tracker
 
 _ARC_TOPK_STATE = None
 _GRAD_QUANTIZATION_STATE = None
@@ -181,7 +182,7 @@ class ArcTopkState:
         use_error_feedback,
     ):
         logger.info(
-            "ArcTopKState: priority_rank=%d, compression_ratio=%.4f; ",
+            "ArcTopkState: priority_rank=%d, compression_ratio=%.4f; ",
             priority_rank,
             compression_ratio,
         )
@@ -196,6 +197,83 @@ class ArcTopkState:
         self.cm = None
         self.stream_context = None
         self.buckets = []
+        
+        # 动态调整相关
+        self._prev_compression_ratio = compression_ratio
+        self._prev_overlap_ratio = 0.0
+        self._adjustment_count = 0
+        self._min_compression_ratio = 0.25  # 最小压缩比 10%
+        self._max_compression_ratio = 1.0  # 最大压缩比 100%
+
+
+    def _adjust_compression_ratio(self):
+        """根据 OverlapRatio 动态调整 Compression Ratio
+        
+        调整策略：
+        - 如果 OverlapRatio 相比上一轮增加，说明通信成为瓶颈，需要降低 Compression Ratio
+        - 每次降低 5%
+        - 如果 OverlapRatio 不增加或降低，则保持当前 Compression Ratio 不变
+        
+        Compression Ratio 含义：
+        - 0.75 表示保留 75% 的梯度（压缩到 75%）
+        - 1.0 表示保留 100% 的梯度（不压缩）
+        - 0.1 表示保留 10% 的梯度（激进压缩）
+        """
+        from megatron.core.distributed.overlap_tracker import get_overlap_tracker
+        
+        try:
+            overlap_tracker = get_overlap_tracker()
+            current_overlap_ratio = overlap_tracker.get_overlap_ratio()
+
+            # 第一轮不调整，只记录初始值
+            if self._adjustment_count == 0:
+                self._prev_overlap_ratio = current_overlap_ratio
+                self._prev_compression_ratio = self.compression_ratio
+                self._adjustment_count += 1
+                logger.info(
+                    f"[ArcTopk] Initial state: compression_ratio={self.compression_ratio:.4f}, "
+                    f"overlap_ratio={current_overlap_ratio:.2%}"
+                )
+                return
+            
+            # 计算 OverlapRatio 的变化
+            overlap_delta = current_overlap_ratio - self._prev_overlap_ratio
+            
+            # 如果 OverlapRatio 增加（通信成为瓶颈），降低 Compression Ratio
+            if overlap_delta > 0:
+                new_compression_ratio = max(
+                    self._min_compression_ratio,
+                    self.compression_ratio - 0.05  # 降低 5%
+                )
+                
+                if new_compression_ratio != self.compression_ratio:
+                    logger.info(
+                        f"[ArcTopk] OverlapRatio increased from {self._prev_overlap_ratio:.2%} "
+                        f"to {current_overlap_ratio:.2%} (delta={overlap_delta:.2%}), "
+                        f"reducing compression_ratio from {self.compression_ratio:.4f} "
+                        f"to {new_compression_ratio:.4f}"
+                    )
+                    self.compression_ratio = new_compression_ratio
+                else:
+                    logger.info(
+                        f"[ArcTopk] OverlapRatio increased but compression_ratio already at minimum "
+                        f"({self.compression_ratio:.4f}), keeping unchanged"
+                    )
+            else:
+                # OverlapRatio 不增加或降低，保持当前 Compression Ratio
+                logger.info(
+                    f"[ArcTopk] OverlapRatio stable/decreased from {self._prev_overlap_ratio:.2%} "
+                    f"to {current_overlap_ratio:.2%} (delta={overlap_delta:.2%}), "
+                    f"keeping compression_ratio at {self.compression_ratio:.4f}"
+                )
+            
+            # 更新历史记录
+            self._prev_overlap_ratio = current_overlap_ratio
+            self._prev_compression_ratio = self.compression_ratio
+            self._adjustment_count += 1
+            
+        except Exception as e:
+            logger.warning(f"[ArcTopk] Failed to adjust compression ratio: {e}")
 
 
     def start_grad_sync(
@@ -205,6 +283,7 @@ class ArcTopkState:
         # stream_context: torch.cuda.StreamContext,
         async_op: bool = False
     ):
+        self._adjust_compression_ratio()
         r"""
         Implement ARC-Top-K algorithm.
 
@@ -268,9 +347,11 @@ class ArcTopkState:
                 P = torch.matmul(gradient, V) / math.sqrt(self.priority_rank)
                 
                 # 发起第一次 All-Reduce
+                overlap_tracker.start_gpu_communication()
                 dist.all_reduce(
                     P, group=self.process_group, async_op=async_op
                 )
+                overlap_tracker.stop_gpu_communication()
                 self.infos[bucket.bucket_id] = {
                     "gradient": gradient,
                     "P": P,
@@ -301,9 +382,11 @@ class ArcTopkState:
                 if self.use_error_feedback:
                     err_gradient = gradient - comm_gradient
                     self.error_dict[bucket.bucket_id] = err_gradient
+                overlap_tracker.start_gpu_communication()
                 dist.all_reduce(
                     comm_gradient, group=self.process_group, async_op=async_op
                 )
+                overlap_tracker.stop_gpu_communication()
                 self.infos[bucket.bucket_id]["comm_gradient"] = comm_gradient
                 self.infos[bucket.bucket_id]["indices"] = indices
                 
