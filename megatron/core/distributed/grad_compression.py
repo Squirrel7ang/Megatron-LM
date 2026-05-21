@@ -391,12 +391,13 @@ class ArcTopkState:
                 
                 # 发起第一次 All-Reduce
                 if adjust_compression_ratio:
-                    overlap_tracker.start_gpu_communication()
+                    try:
+                        overlap_tracker.start_gpu_communication()
+                    except:
+                        pass
                 dist.all_reduce(
                     P, group=self.process_group, async_op=async_op
                 )
-                if adjust_compression_ratio:
-                    overlap_tracker.stop_gpu_communication()
                 self.infos[bucket.bucket_id] = {
                     "gradient": gradient,
                     "P": P,
@@ -407,6 +408,8 @@ class ArcTopkState:
                 
         # 先保证正确性。理论上一个 CUDA Stream 应该是顺序执行的。
         cm.wait()
+        if adjust_compression_ratio:
+            overlap_tracker.stop_gpu_communication()
 
         with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
             for bucket in buckets:
@@ -429,14 +432,15 @@ class ArcTopkState:
                     err_gradient[indices, :] = 0
                     err_gradient = gradient - err_gradient
                     self.error_dict[bucket.bucket_id] = err_gradient.to('cpu')
-                    
+
                 if adjust_compression_ratio:
-                    overlap_tracker.start_gpu_communication()
+                    try:
+                        overlap_tracker.start_gpu_communication()
+                    except:
+                        pass
                 dist.all_reduce(
                     comm_gradient, group=self.process_group, async_op=async_op
                 )
-                if adjust_compression_ratio:
-                    overlap_tracker.stop_gpu_communication()
                 self.infos[bucket.bucket_id]["comm_gradient"] = comm_gradient
                 self.infos[bucket.bucket_id]["indices"] = indices
                 
@@ -514,6 +518,7 @@ class ArcTopkState:
 
     def finish_grad_sync(
         self,
+        adjust_compression_ratio: bool = False,
         # buckets: List[_ParamAndGradBucket],
         # stream_context,
     ):
@@ -541,6 +546,8 @@ class ArcTopkState:
         
         with self.stream_context:
             self.cm.wait()
+            if adjust_compression_ratio:
+                overlap_tracker.stop_gpu_communication()
             for bucket in self.buckets:
                 info = self.infos[bucket.bucket_id]
                 gradient = info["gradient"]

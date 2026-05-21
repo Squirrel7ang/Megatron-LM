@@ -623,7 +623,12 @@ class _ParamAndGradBucketGroup:
                 self.ddp_config.use_error_feedback,
             )
             state = get_arc_topk_state()
-            state.start_grad_sync(self.buckets, stream_context, async_op)
+            state.start_grad_sync(
+                self.buckets,
+                stream_context,
+                async_op,
+                adjust_compression_ratio=self.ddp_config.adjust_compression_ratio
+            )
         elif self.ddp_config.use_grad_quantization and not force_all_reduce:
             from .grad_compression import init_grad_quantization2_state, get_grad_quantization2_state
             init_grad_quantization2_state(
@@ -748,7 +753,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.use_arc_topk:
             from .grad_compression import get_arc_topk_state
             state = get_arc_topk_state()
-            state.finish_grad_sync()
+            state.finish_grad_sync(adjust_compression_ratio=self.ddp_config.adjust_compression_ratio)
             self.grad_reduce_handle = None
             self._copy_back_extra_main_grads()
             return
