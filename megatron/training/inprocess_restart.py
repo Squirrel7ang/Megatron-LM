@@ -158,4 +158,7 @@ def maybe_force_nccl_backend_init(device_id):
     if args.inprocess_restart:
         tensor = torch.ones(128, device=device_id)
         torch.distributed.all_reduce(tensor)
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()

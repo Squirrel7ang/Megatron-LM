@@ -166,7 +166,10 @@ class ProbeEngine:
             # Second barrier + GPU drain before the timed window.
             dist.barrier()
             if use_cuda:
+                from megatron.core.distributed.overlap_tracker import overlap_tracker
+                overlap_tracker.stop_cpu_compute()
                 torch.cuda.synchronize()
+                overlap_tracker.start_cpu_compute()
 
             iters = 20
             if use_cuda:
@@ -183,7 +186,10 @@ class ProbeEngine:
 
             if use_cuda:
                 end_ev.record()
+                from megatron.core.distributed.overlap_tracker import overlap_tracker
+                overlap_tracker.stop_cpu_compute()
                 torch.cuda.synchronize()
+                overlap_tracker.start_cpu_compute()
                 elapsed_ms = start_ev.elapsed_time(end_ev)
             else:
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -277,7 +283,10 @@ class ProbeEngine:
                         dist.isend(ping_t, peer).wait()
 
                 if use_cuda:
+                    from megatron.core.distributed.overlap_tracker import overlap_tracker
+                    overlap_tracker.stop_cpu_compute()
                     torch.cuda.synchronize()
+                    overlap_tracker.start_cpu_compute()
 
                 if rank == src:
                     t_start = time.perf_counter()
@@ -285,7 +294,10 @@ class ProbeEngine:
                         dist.isend(ping_t, peer).wait()
                         dist.irecv(pong_t, peer).wait()
                     if use_cuda:
+                        from megatron.core.distributed.overlap_tracker import overlap_tracker
+                        overlap_tracker.stop_cpu_compute()
                         torch.cuda.synchronize()
+                        overlap_tracker.start_cpu_compute()
                     lat_us = ((time.perf_counter() - t_start) * 1e6) / (iters * 2)
                     worst_latency = max(worst_latency, lat_us)
                 else:
@@ -293,7 +305,10 @@ class ProbeEngine:
                         dist.irecv(pong_t, peer).wait()
                         dist.isend(ping_t, peer).wait()
                     if use_cuda:
+                        from megatron.core.distributed.overlap_tracker import overlap_tracker
+                        overlap_tracker.stop_cpu_compute()
                         torch.cuda.synchronize()
+                        overlap_tracker.start_cpu_compute()
 
                 # ---- Bandwidth ----
                 buf      = torch.randn(activation_size_bytes // 4, device=device)
@@ -302,12 +317,18 @@ class ProbeEngine:
 
                 if rank == src:
                     if use_cuda:
+                        from megatron.core.distributed.overlap_tracker import overlap_tracker
+                        overlap_tracker.stop_cpu_compute()
                         torch.cuda.synchronize()
+                        overlap_tracker.start_cpu_compute()
                     t_start = time.perf_counter()
                     for _ in range(bw_iters):
                         dist.isend(buf, peer).wait()
                     if use_cuda:
+                        from megatron.core.distributed.overlap_tracker import overlap_tracker
+                        overlap_tracker.stop_cpu_compute()
                         torch.cuda.synchronize()
+                        overlap_tracker.start_cpu_compute()
                     t_end = time.perf_counter()
 
                     bw_gbps = (activation_size_bytes * bw_iters * 8) / \
@@ -319,7 +340,10 @@ class ProbeEngine:
                     for _ in range(bw_iters):
                         dist.irecv(recv_buf, peer).wait()
                     if use_cuda:
+                        from megatron.core.distributed.overlap_tracker import overlap_tracker
+                        overlap_tracker.stop_cpu_compute()
                         torch.cuda.synchronize()
+                        overlap_tracker.start_cpu_compute()
 
             finally:
                 # barrier always executed by ALL ranks

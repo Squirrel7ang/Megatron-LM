@@ -108,7 +108,10 @@ def recv_from_prev_pipeline_rank_(
     for req in reqs:
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
+    from megatron.core.distributed.overlap_tracker import overlap_tracker
+    overlap_tracker.stop_cpu_compute()
     torch.cuda.synchronize()
+    overlap_tracker.start_cpu_compute()
 
 
 def send_to_next_pipeline_rank(
@@ -139,7 +142,10 @@ def send_to_next_pipeline_rank(
     for req in reqs:
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
+    from megatron.core.distributed.overlap_tracker import overlap_tracker
+    overlap_tracker.stop_cpu_compute()
     torch.cuda.synchronize()
+    overlap_tracker.start_cpu_compute()
 
 
 def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):

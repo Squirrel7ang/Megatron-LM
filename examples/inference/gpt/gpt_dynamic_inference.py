@@ -366,7 +366,10 @@ def main():
         add_times = result["add_times"]
         output_times = result["output_times"]
         total_output_tokens = result["total_output_tokens"]
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         total_time = get_curr_time() - t
         stats = torch.cuda.memory_stats()
         throughput = total_output_tokens / total_time

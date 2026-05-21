@@ -654,7 +654,10 @@ class DynamicInferenceEngine(AbstractEngine):
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
             range_push(f"{key}-inference-context")
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
 
             yield
 
@@ -759,9 +762,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Allocate context tensors.
             alloc_time = time.time()
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
             self.context.reinitialize_inference_state_buffers()
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
             alloc_time = time.time() - alloc_time
 
             capture_time = time.time()
@@ -774,7 +783,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Re-add requests saved during suspend.
             add_time = time.time()
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
             for request_id in self.resume_request_ids:
                 self._add_request(self.get_request(request_id))
 
@@ -784,7 +796,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.waiting_request_ids.remove(self.context.chunked_prefill_request_id)
                     self.waiting_request_ids.appendleft(self.context.chunked_prefill_request_id)
 
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
             add_time = time.time() - add_time
 
         # Print inner timing (must be outside context manager above for correct formatting).

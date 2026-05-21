@@ -149,7 +149,10 @@ class Timer(TimerBase):
         assert not self._started, 'timer has already been started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         self._start_time = time.time()
         self._started = True
 
@@ -162,7 +165,10 @@ class Timer(TimerBase):
         assert self._started, 'timer is not started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         elapsed = time.time() - self._start_time
         self._elapsed += elapsed
         self._active_time += elapsed

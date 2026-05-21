@@ -168,7 +168,10 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     advise_managed_module_parameters_preferred_location(model_core, device=device, include_buffers=False)
     nbytes = prefetch_managed_module_parameters(model_core, device=device, include_buffers=False)
     # Ensure pages are resident before we enter CUDA-graph capture / inference, or before training continues.
+    from megatron.core.distributed.overlap_tracker import overlap_tracker
+    overlap_tracker.stop_cpu_compute()
     torch.cuda.synchronize()
+    overlap_tracker.start_cpu_compute()
 
     if to_cpu:
         print_rank_0(f"[Rank 0] offloaded {nbytes / 1024**2:.2f} MB of separate RL inference model weights to CPU (other ranks may vary)")
@@ -1423,7 +1426,10 @@ def prepare_data_for_update(
                 model.load_state_dict(cur_st_dict)
 
                 with nvtx_range("rl/synchronize-cuda-and-collect-garbage", time=True):
+                    from megatron.core.distributed.overlap_tracker import overlap_tracker
+                    overlap_tracker.stop_cpu_compute()
                     torch.cuda.synchronize()
+                    overlap_tracker.start_cpu_compute()
                     gc.collect()
                     torch.cuda.empty_cache()
 

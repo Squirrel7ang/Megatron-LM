@@ -260,7 +260,10 @@ class P2PCommunicator:
 
             # To protect against race condition when using batch_isend_irecv().
             # should take this out once the bug with batch_isend_irecv is resolved.
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
@@ -416,7 +419,10 @@ class P2PCommunicator:
         if config.batch_p2p_comm and config.batch_p2p_sync:
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
 
         return tensor_recv_prev, tensor_recv_next, reqs
 

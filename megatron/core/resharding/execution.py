@@ -139,7 +139,10 @@ def execute_reshard_plan(
     # Execute
     logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
+    from megatron.core.distributed.overlap_tracker import overlap_tracker
+    overlap_tracker.stop_cpu_compute()
     torch.cuda.synchronize()
+    overlap_tracker.start_cpu_compute()
     dist.barrier(group=group)
 
     # Write back received buffers into their destination parameter slices.
@@ -193,6 +196,9 @@ def execute_reshard_plan(
     # so without this second sync the .copy_() kernels are still async when
     # execute_reshard_plan returns — creating a race with callers that immediately
     # inspect or capture (via CUDA graphs) the destination parameters.
+    from megatron.core.distributed.overlap_tracker import overlap_tracker
+    overlap_tracker.stop_cpu_compute()
     torch.cuda.synchronize()
+    overlap_tracker.start_cpu_compute()
 
     logger.info("Reshard complete")

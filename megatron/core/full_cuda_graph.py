@@ -167,7 +167,10 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
             for _, state in get_all_rng_states().items():
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
             capture_stream = torch.cuda.Stream()
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
@@ -177,7 +180,10 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
 

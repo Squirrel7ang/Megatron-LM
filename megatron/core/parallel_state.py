@@ -195,7 +195,10 @@ def update_pg_timeout(
     """
     if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
         torch.distributed.barrier(pg)
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         try:
             if pg is None:
                 global _global_process_group_list
@@ -934,7 +937,10 @@ def initialize_model_parallel(
             group=get_data_parallel_group(with_context_parallel=True),
             device_ids=[torch.cuda.current_device()],
         )
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
         if "NCCL_COLLNET_ENABLE" in os.environ:
             del os.environ["NCCL_COLLNET_ENABLE"]
@@ -1320,7 +1326,10 @@ def initialize_model_parallel(
                         group=_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
                         device_ids=[torch.cuda.current_device()],
                     )
+                    from megatron.core.distributed.overlap_tracker import overlap_tracker
+                    overlap_tracker.stop_cpu_compute()
                     torch.cuda.synchronize()
+                    overlap_tracker.start_cpu_compute()
                 # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
                 if "NCCL_COLLNET_ENABLE" in os.environ:
                     del os.environ["NCCL_COLLNET_ENABLE"]

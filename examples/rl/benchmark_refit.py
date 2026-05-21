@@ -98,10 +98,16 @@ def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iteration
     # Warmup (builds refit plan on first iteration)
     print_rank_0(f"Warmup: {num_warmup} iterations...")
     for i in range(num_warmup):
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         torch.distributed.barrier()
         swap_model_weights(src_model, dst_model, refit_method=refit_service)
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         torch.distributed.barrier()
 
     print_rank_0("Warmup complete. Starting benchmark...\n")
@@ -111,12 +117,18 @@ def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iteration
     timings = []
 
     for i in range(num_iterations):
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         torch.distributed.barrier()
 
         start_time = time.perf_counter()
         swap_model_weights(src_model, dst_model, refit_method=refit_service)
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         end_time = time.perf_counter()
 
         elapsed = end_time - start_time

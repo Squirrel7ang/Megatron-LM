@@ -270,7 +270,10 @@ class TemporalAsyncCaller(AsyncCaller):
 
         rank = torch.distributed.get_rank()
         start_sync = time()
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         end_sync = time()
         logger.debug(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
 

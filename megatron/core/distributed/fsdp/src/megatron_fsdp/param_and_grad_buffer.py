@@ -796,7 +796,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             ):
                 # Requires synchronization for new buffer allocation
                 self.allocation_tracker[(buffer_name, dtype)] = size
+                from megatron.core.distributed.overlap_tracker import overlap_tracker
+                overlap_tracker.stop_cpu_compute()
                 torch.cuda.synchronize()
+                overlap_tracker.start_cpu_compute()
         return Bucket(
             data=get_global_memory_buffer().get_tensor(
                 [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
@@ -1844,9 +1847,15 @@ class ParamAndGradBuffer:
         self.already_registered = True
 
         global NCCL_MEMORY_POOL
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         torch.distributed.barrier(async_op=False)
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
 
         for group in self.ubr_groups:
             log_single_rank(

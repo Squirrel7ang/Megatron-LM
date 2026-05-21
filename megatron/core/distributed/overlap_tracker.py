@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 class OverlapTracker:
     _lock: threading.Lock = threading.Lock()
     
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool = False) -> None:
         """初始化跟踪器（线程安全）"""
         if getattr(self, '_initialized', False):
             return
@@ -52,42 +52,56 @@ class OverlapTracker:
 
         self.stats = None
         self.origin_cpu_cuda_synchronize: Callable
+
+        self.enabled = False
     
     # ==================== 上下文管理器（推荐用法） ====================
 
     def start_recording(self):
+        if not self.enabled:
+            return
         with self._lock:
             self._record_start_time()
-            self._start_mock_cpu_cuda_synchronize()
+            # self._start_mock_cpu_cuda_synchronize()
             self.start_cpu_compute()
 
 
     def _record_start_time(self):
+        if not self.enabled:
+            return
         self._iteration_anchor = torch.cuda.Event(enable_timing=True)
         self._iteration_anchor.record(torch.cuda.current_stream())
         self._cpu_anchor_time = time.time()
 
     def stop_recording(self):
+        if not self.enabled:
+            return
         with self._lock:
             self.stats = self._cal_stats()
-            self._stop_mock_cpu_cuda_synchronize()
+            # self._stop_mock_cpu_cuda_synchronize()
             self._reset()
 
     # ==================== CPU ====================
 
     def _start_mock_cpu_cuda_synchronize(self):
-        # Mock 掉 torch.cuda.synchronize() 函数
+        if not self.enabled:
+            return
+        torch.cuda.synchronize()
         self.origin_cpu_cuda_synchronize = torch.cuda.synchronize
         torch.cuda.synchronize = _tracked_cuda_synchronize
         pass
 
     def _stop_mock_cpu_cuda_synchronize(self):
+        if not self.enabled:
+            return
         # 取消 Mock
         torch.cuda.synchronize = self.origin_cpu_cuda_synchronize
         self.origin_cpu_cuda_synchronize = None
         pass
 
     def start_cpu_compute(self) -> float:
+        if not self.enabled:
+            return
         """开始记录 CPU 计算时间"""
         with self._lock:
             if self._is_recording_cpu:
@@ -98,6 +112,8 @@ class OverlapTracker:
             return self._cpu_start_time
 
     def stop_cpu_compute(self) -> float:
+        if not self.enabled:
+            return
         """结束记录 CPU 计算时间，返回本次记录的时间（毫秒）"""
         with self._lock:
             if not self._is_recording_cpu:
@@ -121,6 +137,8 @@ class OverlapTracker:
     # ==================== Comm ====================
 
     def start_gpu_communication(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        if not self.enabled:
+            return
         """开始记录 GPU 通信时间
 
         Args:
@@ -138,6 +156,8 @@ class OverlapTracker:
             self._is_recording_comm = True
 
     def stop_gpu_communication(self, stream: Optional[torch.cuda.Stream] = None) -> float:
+        if not self.enabled:
+            return
         """结束记录 GPU 通信时间，返回本次记录的时间（毫秒）
 
         Args:
@@ -200,6 +220,8 @@ class OverlapTracker:
     # ==================== 统计信息 ====================
 
     def _calculate_interval_overlap(self, events1: List[tuple], events2: List[tuple]) -> float:
+        if not self.enabled:
+            return
         """计算两组时间区间的总重叠时间（单位：毫秒）
 
         Args:
@@ -225,6 +247,8 @@ class OverlapTracker:
         return total_overlap
 
     def _cal_stats(self) -> Dict[str, float]:
+        if not self.enabled:
+            return
         """获取统计信息
 
         Returns:
@@ -269,10 +293,14 @@ class OverlapTracker:
         }
 
     def get_overlap_ratio(self):
+        if not self.enabled:
+            return
         with self._lock:
             return self.stats['overlap_ratio']
     
     def _reset(self) -> None:
+        if not self.enabled:
+            return
         """重置所有计时器和计数器"""
         self._cpu_compute_time = 0.0
         self._gpu_communication_time = 0.0
@@ -292,6 +320,8 @@ class OverlapTracker:
             pass
 
     def step(self):
+        if not self.enabled:
+            return
         with self._lock:
             self.stats = self._cal_stats()
             self._reset()
@@ -311,7 +341,9 @@ class OverlapTracker:
 
 
 # 创建全局实例
-overlap_tracker = OverlapTracker()
+overlap_tracker = OverlapTracker(
+    enabled=False,
+)
 
 _flag = False
 

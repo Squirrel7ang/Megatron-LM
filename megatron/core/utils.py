@@ -1577,7 +1577,10 @@ class StragglerDetector:
             power = torch.cuda.power_draw()
             util = torch.cuda.utilization()
             clock = torch.cuda.clock_rate()
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
             # Process Events
             for i in range(ls_ev):
                 e_ev = self.start_gemm_ev[i].elapsed_time(self.stop_gemm_ev[i])

@@ -245,7 +245,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                 del tensor
             result.append((file_name, storage_key, (bytes_data, tensor_list)))
         if non_blocking:
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
         return result
 
     @staticmethod

@@ -1915,7 +1915,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor
             if is_te_min_version("2.0.0"):
+                from megatron.core.distributed.overlap_tracker import overlap_tracker
+                overlap_tracker.stop_cpu_compute()
                 torch.cuda.synchronize()
+                overlap_tracker.start_cpu_compute()
                 state_serialized = bytearray(pickle.dumps(state))
                 state_serialized = torch.frombuffer(state_serialized, dtype=torch.uint8)
             else:

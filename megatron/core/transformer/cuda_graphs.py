@@ -934,7 +934,10 @@ class _CudaGraphRunner(torch.nn.Module):
             _set_warmup_end()
 
             with self.get_quantization_context():
+                from megatron.core.distributed.overlap_tracker import overlap_tracker
+                overlap_tracker.stop_cpu_compute()
                 torch.cuda.synchronize()
+                overlap_tracker.start_cpu_compute()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
                 # before capture begins, to avoid inference-tensor state issues during capture.
                 with torch.inference_mode(mode=False):
@@ -2231,7 +2234,10 @@ class TECudaGraphHelper:
         """
         assert not self._capture_finished, "CUDA Graph capture has already been finished."
 
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         gc.collect()
         torch.cuda.empty_cache()
         if FREEZE_GC:
@@ -2267,7 +2273,10 @@ class TECudaGraphHelper:
         )
         _set_capture_end()
 
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
         self._reset_after_capture()
         if FREEZE_GC:
             gc.unfreeze()

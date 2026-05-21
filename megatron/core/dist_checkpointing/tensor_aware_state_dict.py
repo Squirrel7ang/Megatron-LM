@@ -301,7 +301,10 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                         parallelization_group,
                         exchange_algo,
                     )
+                    from megatron.core.distributed.overlap_tracker import overlap_tracker
+                    overlap_tracker.stop_cpu_compute()
                     torch.cuda.synchronize()
+                    overlap_tracker.start_cpu_compute()
         loaded_objects = {}
         for sh_base in nested_values(self.sharded_state_dict):
             if not isinstance(sh_base, ShardedTensor):

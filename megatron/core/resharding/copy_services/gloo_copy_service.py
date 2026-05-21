@@ -144,7 +144,10 @@ class GlooCopyService(CopyService):
             cpu_send_bufs.append(cpu_tensor)
         # Single sync after all GPU→CPU copies are issued.
         if cpu_send_bufs:
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
 
         for op in remote_sends:
             op.tensor = None
@@ -175,7 +178,10 @@ class GlooCopyService(CopyService):
             torch.cuda.current_stream().wait_stream(self._copy_stream)
 
         # Ensure all async CPU→GPU copies are complete.
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
 
         if self.rank == 0:
             logger.info("GlooCopyService: batched communication completed")

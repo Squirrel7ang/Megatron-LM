@@ -177,7 +177,10 @@ def _assert_within_baseline(
 
 
 def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
+    from megatron.core.distributed.overlap_tracker import overlap_tracker
+    overlap_tracker.stop_cpu_compute()
     torch.cuda.synchronize()
+    overlap_tracker.start_cpu_compute()
     set_experimental_flag(True)
 
     forward_timings = []
@@ -235,7 +238,10 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
             bwd_end.record()
 
         torch.cuda.nvtx.range_pop()
+        from megatron.core.distributed.overlap_tracker import overlap_tracker
+        overlap_tracker.stop_cpu_compute()
         torch.cuda.synchronize()
+        overlap_tracker.start_cpu_compute()
 
         if iteration >= WARMUP_ITERS:
             forward_timings.append(fwd_start.elapsed_time(fwd_end))

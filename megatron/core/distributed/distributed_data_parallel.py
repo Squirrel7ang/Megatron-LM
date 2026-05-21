@@ -606,7 +606,10 @@ class DistributedDataParallel(_BaseDataParallel):
             empty_cache: Whether to call torch.cuda.empty_cache() after freeing.
         """
         if synchronize:
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
 
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
@@ -629,4 +632,7 @@ class DistributedDataParallel(_BaseDataParallel):
             buffer.reload_from_cpu(move_params=False, move_grads=True)
 
         if synchronize:
+            from megatron.core.distributed.overlap_tracker import overlap_tracker
+            overlap_tracker.stop_cpu_compute()
             torch.cuda.synchronize()
+            overlap_tracker.start_cpu_compute()
