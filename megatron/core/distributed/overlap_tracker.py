@@ -52,7 +52,7 @@ class OverlapTracker:
         self.stats = None
         self.origin_cpu_cuda_synchronize: Callable
 
-        self.enabled = False
+        self.enabled = enabled
     
     # ==================== 上下文管理器（推荐用法） ====================
 
@@ -60,6 +60,7 @@ class OverlapTracker:
         if not self.enabled:
             return
         with self._lock:
+            logger.info("OverlapTracker start_recording")
             self._is_recording = True
             self._record_start_time()
             # self._start_mock_cpu_cuda_synchronize()
@@ -79,6 +80,7 @@ class OverlapTracker:
         with self._lock:
             if not self._is_recording:
                 return
+            logger.info("OverlapTracker stop_recording")
             self._is_recording = False
             self.stats = self._cal_stats()
             # self._stop_mock_cpu_cuda_synchronize()
@@ -303,7 +305,7 @@ class OverlapTracker:
 
     def get_overlap_ratio(self):
         if not self.enabled:
-            return
+            return 0.0
         with self._lock:
             return self.stats['overlap_ratio']
     
@@ -354,7 +356,7 @@ class OverlapTracker:
 
 # 创建全局实例
 overlap_tracker = OverlapTracker(
-    enabled=False,
+    enabled=True,
 )
 
 _flag = False
