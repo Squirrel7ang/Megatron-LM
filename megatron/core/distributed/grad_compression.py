@@ -299,11 +299,12 @@ class ArcTopkState:
                     )
             else:
                 # OverlapRatio 不增加或降低，保持当前 Compression Ratio
-                logger.info(
-                    f"[ArcTopk] OverlapRatio stable/decreased from {self._prev_overlap_ratio:.2%} "
-                    f"to {current_overlap_ratio:.2%} (delta={overlap_delta:.2%}), "
-                    f"keeping compression_ratio at {self.compression_ratio:.4f}"
-                )
+                # logger.info(
+                #     f"[ArcTopk] OverlapRatio stable/decreased from {self._prev_overlap_ratio:.2%} "
+                #     f"to {current_overlap_ratio:.2%} (delta={overlap_delta:.2%}), "
+                #     f"keeping compression_ratio at {self.compression_ratio:.4f}"
+                # )
+                pass
             
             # 更新历史记录
             self._prev_overlap_ratio = current_overlap_ratio
@@ -577,7 +578,7 @@ class GradQuantizationState:
         process_group,
         use_error_feedback,
         dtype,
-        use_hadamard_transformation
+        use_hadamard_transformation:bool = False,
     ):
         self.process_group = process_group
         self.use_error_feedback = use_error_feedback
@@ -751,7 +752,7 @@ class GradQuantization2State:
         self,
         process_group,
         use_error_feedback: bool,
-        bitwidth: int = 4,
+        bitwidth: int = 8,
         stochastic_rounding: bool = False,
         block_size: int = 256,
     ):
@@ -804,6 +805,8 @@ class GradQuantization2State:
             stream_context: CUDA stream context for async operations.
             async_op: Whether to perform asynchronous operations.
         """
+        if dist.get_rank() == 0:
+            logger.info(f"bitscom {self.bitwidth=}")
 
         process_group = self.process_group
         rank = process_group.rank() if process_group is not None else dist.get_rank()
@@ -840,12 +843,12 @@ class GradQuantization2State:
             if adjust_compression_ratio:
                 overlap_tracker.start_gpu_communication()
 
-                # Use bitscom's low-bit all_reduce
-                self.lowbit_group.all_reduce(
-                    gradient,
-                    op=dist.ReduceOp.SUM,
-                    async_op=async_op,
-                )
+            # Use bitscom's low-bit all_reduce
+            self.lowbit_group.all_reduce(
+                gradient,
+                op=dist.ReduceOp.SUM,
+                async_op=async_op,
+            )
 
             # Stop GPU communication tracking
             if adjust_compression_ratio:
@@ -870,6 +873,7 @@ class GradQuantization2State:
                     sync_bucket(bucket)
         else:
             with stream_context:
+                cm = None
                 for bucket in buckets:
                     sync_bucket(bucket)
                 # gradient = bucket.grad_data

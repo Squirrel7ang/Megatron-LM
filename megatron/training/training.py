@@ -1485,6 +1485,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 kwargs['grad_quantization_dtype'] = torch.int8
             else:
                 kwargs['grad_quantization_dtype'] = args.grad_quantization_dtype
+            kwargs['use_bitscom'] = args.use_bitscom
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
@@ -2895,6 +2896,9 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        from megatron.core.distributed.overlap_tracker import get_overlap_tracker
+        overlap_tracker = get_overlap_tracker()
+        overlap_tracker.start_cpu_compute()
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
@@ -2905,8 +2909,6 @@ def train(
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
         if args.adjust_compression_ratio:
-            from megatron.core.distributed.overlap_tracker import get_overlap_tracker
-            overlap_tracker = get_overlap_tracker()
             overlap_tracker.start_recording()
 
         ft_integration.on_checkpointing_start()
@@ -2979,6 +2981,7 @@ def train(
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
+            overlap_tracker.stop_cpu_compute()
             continue
 
         args.curr_iteration = iteration
@@ -3043,8 +3046,6 @@ def train(
             if args.adjust_compression_ratio:
                 overlap_tracker.stop_recording()
             break
-        if args.adjust_compression_ratio:
-            overlap_tracker.stop_recording()
 
         # Enable forward pre-hooks after first set of forward and backward passes.
         # When running in fp16, skip all NaN iterations until steady-state loss scaling value

@@ -611,6 +611,19 @@ class _ParamAndGradBucketGroup:
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
             communication_group = self.data_parallel_group
+            
+        from .grad_compression import (
+            init_grad_quantization_state,
+            get_grad_quantization_state,
+            init_grad_quantization2_state,
+            get_grad_quantization2_state,
+        )
+        if self.ddp_config.use_bitscom:
+            init_grad_quantization_state_func = init_grad_quantization2_state
+            get_grad_quantization_state_func = get_grad_quantization2_state
+        else:
+            init_grad_quantization_state_func = init_grad_quantization_state
+            get_grad_quantization_state_func = get_grad_quantization_state
 
         # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
@@ -630,14 +643,20 @@ class _ParamAndGradBucketGroup:
                 adjust_compression_ratio=self.ddp_config.adjust_compression_ratio
             )
         elif self.ddp_config.use_grad_quantization and not force_all_reduce:
-            from .grad_compression import init_grad_quantization2_state, get_grad_quantization2_state
-            init_grad_quantization2_state(
-                communication_group,
-                self.ddp_config.use_error_feedback,
-                bitwidth=8,
-                stochastic_rounding=False,
-            )
-            state = get_grad_quantization2_state()
+            if self.ddp_config.use_bitscom:
+                init_grad_quantization_state_func(
+                    communication_group,
+                    self.ddp_config.use_error_feedback,
+                    bitwidth=8,
+                    stochastic_rounding=False,
+                )
+            else:
+                init_grad_quantization_state_func(
+                    communication_group,
+                    self.ddp_config.use_error_feedback,
+                    dtype=self.ddp_config.grad_quantization_dtype
+                )
+            state = get_grad_quantization_state_func()
             state.start_grad_sync(self.buckets, stream_context, async_op)
         else:
             with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
@@ -750,6 +769,16 @@ class _ParamAndGradBucketGroup:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
+        from .grad_compression import (
+            init_grad_quantization_state,
+            get_grad_quantization_state,
+            init_grad_quantization2_state,
+            get_grad_quantization2_state,
+        )
+        if self.ddp_config.use_bitscom:
+            get_grad_quantization_state_func = get_grad_quantization2_state
+        else:
+            get_grad_quantization_state_func = get_grad_quantization_state
         if self.ddp_config.use_arc_topk:
             from .grad_compression import get_arc_topk_state
             state = get_arc_topk_state()
@@ -758,8 +787,7 @@ class _ParamAndGradBucketGroup:
             self._copy_back_extra_main_grads()
             return
         if self.ddp_config.use_grad_quantization:
-            from .grad_compression import get_grad_quantization2_state
-            state = get_grad_quantization2_state()
+            state = get_grad_quantization_state_func()
             state.finish_grad_sync()
             self.grad_reduce_handle = None
             self._copy_back_extra_main_grads()

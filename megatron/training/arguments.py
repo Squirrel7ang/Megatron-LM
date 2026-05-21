@@ -2771,6 +2771,8 @@ def _add_distributed_args(parser):
                             'compression/quantization error across iterations.')
     group.add_argument('--adjust-compression-ratio', action='store_true', default=False,
                        help='Adjust compression ratio for ARC-TopK.')
+    group.add_argument('--use-bitscom', action='store_true', default=False,
+                       help='Enable bitscom gradient compression.')
     return parser
 
 

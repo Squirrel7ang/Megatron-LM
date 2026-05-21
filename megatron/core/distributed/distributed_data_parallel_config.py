@@ -218,6 +218,8 @@ class DistributedDataParallelConfig:
     """
 
     adjust_compression_ratio: bool = False
+    
+    use_bitscom: bool = False
 
     def __post_init__(self):
         import os
