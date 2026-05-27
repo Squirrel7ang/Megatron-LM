@@ -128,18 +128,24 @@ TRAINING_ARGS=(
     # --overlap-grad-gather 
     
     --use-arc-topk
-    --arc-topk-compression-ratio 0.5
+    --arc-topk-compression-ratio 0.1
+    --use-error-feedback
 
     # --use-grad-quantization
     # --grad-quantization-dtype fp8
     # --use-bitscom
     
-    --adjust-compression-ratio
+    # --adjust-compression-ratio
 )
 
 MODEL_PARALLEL_ARGS=(
 	--tensor-model-parallel-size 1 
 	--pipeline-model-parallel-size 1 
+    
+    # offloading
+    --optimizer-cpu-offload
+    --optimizer-offload-fraction 1
+    --use-precision-aware-optimizer
 
     # --use-torch-fsdp2 
     # --ckpt-format torch_dist 

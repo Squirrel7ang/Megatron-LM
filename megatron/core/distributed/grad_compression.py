@@ -211,6 +211,11 @@ def _dequantize_per_channel_backend(y, scale, zero_point):
 cnt=0
 
 
+current_device = torch.cuda.current_device()
+rand_gen = torch.Generator(device=f'cuda:{current_device}')
+rand_gen.manual_seed(1234)
+
+
 class ArcTopkState:
     def __init__(
         self,
@@ -234,7 +239,7 @@ class ArcTopkState:
         self.infos = {}
         self.cm = None
         self.stream_context = None
-        self.buckets = []
+        self.buckets = {}
         
         # 动态调整相关
         self._prev_compression_ratio = compression_ratio
@@ -353,22 +358,31 @@ class ArcTopkState:
         """
         global cnt
         cnt += 1
+        # logger.info(f"Start Grad Sync Begin {cnt=}")
 
         self.all_futs = []
         
         process_group = self.process_group
         rank = process_group.rank()
+        group_to_use = (
+            self.process_group if self.process_group is not None else dist.group.WORLD
+        )
+        world_size = dist.get_world_size(group=group_to_use)
         # logger.info(f"Start Grad Sync Begin {cnt=}, rank={rank}")
 
         self.stream_context = stream_context
-        self.buckets = buckets
         # 显式遍历每一个 bucket
         with stream_context, _coalescing_manager(self.process_group, async_ops=async_op) as cm:
-            for bucket in buckets:
+            for num, bucket in enumerate(buckets):
+                # if bucket.bucket_id in self.buckets:
+                #     logger.info(f"[Rank {rank}] [Rank {rank}] bucket duplicated {bucket.bucket_id=}")
+                self.buckets[bucket.bucket_id] = bucket
+                # logger.info(f"[Rank {rank}] [Rank {rank}] bucket recorded {bucket.bucket_id=}")
+                # logger.info(f"bucket.bucket_id: {bucket.bucket_id}, num: {num}")
 
                 def _cal_max_factor(size: int):
                     factor: int = 1
-                    while size % factor == 0 and size / factor > factor:
+                    while size % factor == 0 and size / factor > 2*factor:
                         factor *= 2
                     if size % factor != 0:
                         factor = factor // 2
@@ -376,18 +390,29 @@ class ArcTopkState:
 
                 # 在 Megatron 中使用 bucket.grad_data 代替 bucket.buffer()
                 gradient = bucket.grad_data
-                if (
-                    self.use_error_feedback
-                    and bucket.bucket_id in self.error_dict
-                    and self.error_dict[bucket.bucket_id] is not None
-                ):
-                    gradient += self.error_dict[bucket.bucket_id].to(gradient.device).view(gradient.shape)
+                # for id, ef in self.error_dict.items():
+                #     logger.info(f"[Rank {rank}] [Rank {rank}] error_dict[{id}]: {ef}")
+                    
+                if self.use_error_feedback:
+                    if bucket.bucket_id in self.error_dict and self.error_dict[bucket.bucket_id] is not None:
+                        feedback_gradient = self.error_dict[bucket.bucket_id].view(gradient.shape)
+                        if cnt <= 13200 and bucket.bucket_id == 0 and dist.get_rank() == 0:
+                            logger.info("------------------------- Feedback --------------------------")
+                            logger.info(f"[Rank {rank}] gradient[{gradient.shape}]: {gradient.sum()}")
+                            logger.info(f"[Rank {rank}] feedback_gradient[{feedback_gradient.shape}]: {feedback_gradient.sum()}")
+                        gradient += feedback_gradient
+                        if cnt <= 13200 and bucket.bucket_id == 0 and dist.get_rank() == 0:
+                            logger.info(f"[Rank {rank}] gradient[{gradient.shape}]: {gradient.sum()}")
+                    else:
+                        self.error_dict[bucket.bucket_id] = torch.zeros_like(gradient)
+
                 d = gradient.numel()
                 row_num = _cal_max_factor(d)
                 gradient = gradient.view(-1, row_num)
+                # logger.info(f"[Rank {rank}] gradient: {gradient}")
 
                 # calculate global priority
-                V = torch.randn(row_num, self.priority_rank, device=gradient.device, dtype=gradient.dtype)
+                V = torch.randn(row_num, self.priority_rank, device=gradient.device, dtype=gradient.dtype, generator=rand_gen)
                 P = torch.matmul(gradient, V) / math.sqrt(self.priority_rank)
                 
                 # 发起第一次 All-Reduce
@@ -427,18 +452,17 @@ class ArcTopkState:
                 K = max(1, int(col_num * self.compression_ratio))
                 indices = torch.topk(score, k=K).indices.sort().values
                 
+                comm_gradient = torch.zeros_like(gradient[indices, :])
+                
                 comm_gradient = gradient[indices, :]
-                if self.use_error_feedback:
-                    err_gradient = gradient.clone()
-                    err_gradient[indices, :] = 0
-                    err_gradient = gradient - err_gradient
-                    self.error_dict[bucket.bucket_id] = err_gradient.to('cpu')
 
                 if adjust_compression_ratio:
                     try:
                         overlap_tracker.start_gpu_communication()
                     except:
                         pass
+                if bucket.bucket_id == 0:
+                    logger.info(f"[{dist.get_rank()}] comm_gradient[{comm_gradient.shape}]: {comm_gradient.sum()}")
                 dist.all_reduce(
                     comm_gradient, group=self.process_group, async_op=async_op
                 )
@@ -449,74 +473,6 @@ class ArcTopkState:
         # logger.info(f"Start Grad Sync End {cnt=}, rank={rank}")
 
 
-        # with stream_context:
-        #     for bucket in buckets:
-        #         # --- 以下代码完全保留源代码变量名称与逻辑 ---
-                
-        #         process_group = self.process_group
-        #         # 适配 Megatron 进程组获取逻辑
-        #         group_to_use = (
-        #             process_group if process_group is not None else dist.group.WORLD
-        #         )
-        #         world_size = dist.get_world_size(group=group_to_use)
-
-        #         def _cal_max_factor(size: int):
-        #             factor: int = 1
-        #             while size % factor == 0 and size / factor > factor:
-        #                 factor *= 2
-        #             if size % factor != 0:
-        #                 factor = factor // 2
-        #             return factor
-
-        #         # 在 Megatron 中使用 bucket.grad_data 代替 bucket.buffer()
-        #         gradient = bucket.grad_data
-        #         d = gradient.numel()
-        #         row_num = _cal_max_factor(d)
-        #         gradient = gradient.view(-1, row_num)
-
-        #         # calculate global priority
-        #         V = torch.randn(row_num, self.priority_rank, device=gradient.device, dtype=gradient.dtype)
-        #         P = torch.matmul(gradient, V) / math.sqrt(self.priority_rank)
-                
-        #         # 发起第一次 All-Reduce
-        #         fut = dist.all_reduce(
-        #             P, group=self.process_group, async_op=async_op
-        #         ).get_future()
-                
-        #         # 为当前 bucket 独立维护 indices_holder 避免多 bucket 并发干扰
-        #         indices_holder = []
-
-        #         def compress_and_allreduce(fut):
-        #             # fut 是前一个阶段返回的 future，通过 wait() 或 value() 获取 P
-        #             score = (P * P).sum(dim=1)
-        #             # score = torch.diag(torch.matmul(P, P.T))
-        #             col_num = d / row_num
-        #             K = max(1, int(col_num * self.compression_ratio))
-        #             indices = torch.topk(score, k=K).indices
-        #             indices_holder.append(indices)
-
-        #             comm_gradient = gradient[indices, :]
-        #             comm_fut = dist.all_reduce(
-        #                 comm_gradient, group=self.process_group, async_op=async_op
-        #             ).get_future()
-
-        #             # 原代码逻辑：返回 wait() 的结果
-        #             return comm_fut.wait()
-
-        #         def decompress_and_finalize(fut):
-        #             # 获取第二次 All-Reduce 的结果
-        #             avg_gradient = fut.wait()[0] / world_size
-        #             indices = indices_holder[0]
-        #             gradient.zero_()
-        #             gradient[indices, :] = avg_gradient
-
-        #             return gradient
-
-        #         # 链式调用并将最终的 future 存入列表
-        #         # 注意：这里的 .then() 逻辑会按顺序在后台执行
-        #         chained_fut = fut.then(compress_and_allreduce).then(decompress_and_finalize)
-        #         self.all_futs.append(chained_fut)
-
     def finish_grad_sync(
         self,
         adjust_compression_ratio: bool = False,
@@ -526,13 +482,6 @@ class ArcTopkState:
         """
         确保在这之前完成所有梯度的同步。
         """
-        # if self.all_futs:
-        #     for fut in self.all_futs:
-        #         # 阻塞直到该 bucket 的整个异步链条（P 同步 -> 计算 -> G 同步 -> 还原）完成
-        #         fut.wait()
-        #     # 清空以备下一轮使用
-        #     self.all_futs = []
-        
         if self.stream_context == None:
             return
         
@@ -545,21 +494,56 @@ class ArcTopkState:
         )
         world_size = dist.get_world_size(group=group_to_use)
         
+        
         with self.stream_context:
             self.cm.wait()
             if adjust_compression_ratio:
                 overlap_tracker.stop_gpu_communication()
-            for bucket in self.buckets:
+            # logger.info(f"[Rank {rank}] [Rank {rank}] {self.use_error_feedback=}")
+            for bucket in self.buckets.values():
+                # logger.info(f"bucket.bucket_id: {bucket.bucket_id}")
+                # logger.info(f"{len(self.buckets)=}")
                 info = self.infos[bucket.bucket_id]
                 gradient = info["gradient"]
                 comm_gradient = info["comm_gradient"]
                 indices = info["indices"]
                 avg_gradient = comm_gradient / world_size
+                if self.use_error_feedback:
+                    err_gradient = gradient.clone()
+                    # if cnt <= 13200 and bucket.bucket_id == 0 and dist.get_rank() == 0:
+                    #     logger.info("------------------------- Error --------------------------")
+                    #     logger.info(f"[Rank {rank}] err_gradient(.clone())[{err_gradient.shape}]: {err_gradient}")
+                    #     logger.info(f"[Rank {rank}] err_gradient(.clone())[{err_gradient.shape}]: {err_gradient.sum()}")
+                    err_gradient[indices, :] = 0
+                    # if cnt <= 13200 and bucket.bucket_id == 0 and dist.get_rank() == 0:
+                    #     logger.info(f"[Rank {rank}] indices: {indices}")
+                    #     logger.info(f"[Rank {rank}] err_gradient(zero)[{err_gradient.shape}]: {err_gradient}")
+                    #     logger.info(f"[Rank {rank}] err_gradient(zero)[{err_gradient.shape}]: {err_gradient.sum()}")
+                    # err_gradient = gradient - err_gradient
+                    # if cnt <= 13200 and bucket.bucket_id == 0 and dist.get_rank() == 0:
+                    #     logger.info(f"[Rank {rank}] err_gradient(sub)[{err_gradient.shape}]: {err_gradient.sum()}")
+                    # self.error_dict[bucket.bucket_id] = err_gradient.to('cpu')
+                    # if cnt <= 13200 and bucket.bucket_id == 0 and dist.get_rank() == 0:
+                    #     logger.info(f"[Rank {rank}] error_dict[{bucket.bucket_id}]: {self.error_dict[bucket.bucket_id]}")
+                    self.error_dict[bucket.bucket_id] = err_gradient
+                    if cnt <= 13200 and bucket.bucket_id == 0 and dist.get_rank() == 0:
+                    #     logger.info(f"[Rank {rank}] gradient[{gradient.shape}]: {gradient}")
+                    #     logger.info(f"[Rank {rank}] avg_gradient[{avg_gradient.shape}]: {avg_gradient}")
+                    #     logger.info(f"[Rank {rank}] err_gradient[{err_gradient.shape}]: {err_gradient}")
+                    #     logger.info(f"[Rank {rank}] error_dict[{bucket.bucket_id}]: {self.error_dict[bucket.bucket_id]}")
+                        logger.info(f"[Rank {rank}] gradient[{gradient.shape}]: {gradient.sum()}")
+                        logger.info(f"[Rank {rank}] avg_gradient[{avg_gradient.shape}]: {avg_gradient.sum()}")
+                        logger.info(f"[Rank {rank}] err_gradient[{err_gradient.shape}]: {err_gradient.sum()}")
+                        logger.info(f"[Rank {rank}] error_dict[{bucket.bucket_id}]: {self.error_dict[bucket.bucket_id].sum()}")
                 gradient.zero_()
                 gradient[indices, :] = avg_gradient
+                
+        # for id, ef in self.error_dict.items():
+        #     logger.info(f"[Rank {rank}] [Rank {rank}] error_dict[{id}]: {ef}")
+
         self.infos = {}
         self.stream_context = None
-        self.buckets = []
+        self.buckets = {}
 
 
 class GradQuantizationState:
