@@ -789,7 +789,7 @@ class GradQuantization2State:
             stream_context: CUDA stream context for async operations.
             async_op: Whether to perform asynchronous operations.
         """
-        if dist.get_rank() == 0:
+        if dist.get_rank() == 0 and buckets[0].bucket_id == 0:
             logger.info(f"bitscom {self.bitwidth=}")
 
         process_group = self.process_group
@@ -802,18 +802,28 @@ class GradQuantization2State:
         def sync_bucket(
                 b,
         ):
+            rank = dist.get_rank()
             gradient = b.grad_data
             bucket_index = b.bucket_id
+
+            # if rank == 0 and bucket_index == 0:
+            #     logger.info(f"[Rank {rank}] {cnt=}")
+            # if cnt >= 121:
+            #     self.use_error_feedback = True
+            # else:
+            #     self.use_error_feedback = True
 
             # Apply error feedback if enabled
             if self.use_error_feedback:
                 if bucket_index in self.error_dict:
+                    if bucket_index == 0 and rank == 0:
+                        logger.info(f"Error: {self.error_dict[bucket_index].flatten()[0]}")
                     gradient.add_(self.error_dict[bucket_index])
                 else:
-                    logger.info(
-                        "A zero tensor of length %s that represents local error is created.",
-                        gradient.numel(),
-                    )
+                    # logger.info(
+                    #     "A zero tensor of length %s that represents local error is created.",
+                    #     gradient.numel(),
+                    # )
                     self.error_dict[bucket_index] = torch.zeros(
                         gradient.shape,
                         device=gradient.device,
@@ -843,6 +853,10 @@ class GradQuantization2State:
                 # Error = original - (reduced / world_size)
                 reduced_avg = gradient / world_size
                 self.error_dict[bucket_index] = original_grad - reduced_avg
+                if bucket_index == 0 and rank == 0:
+                    logger.info(f"Original: {original_grad.flatten()[0]}")
+                    logger.info(f"Reduced: {reduced_avg.flatten()[0]}")
+                    logger.info(f"Error: {self.error_dict[bucket_index].flatten()[0]}")
 
             # Store info for finish_grad_sync
             self.all_infos[bucket_index] = {
@@ -935,3 +949,5 @@ class GradQuantization2State:
         self.stream_context = None
         self.buckets = []
         self.cm = None
+        global cnt
+        cnt += 1

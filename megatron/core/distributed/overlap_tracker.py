@@ -358,7 +358,7 @@ class OverlapTracker:
 
 # 创建全局实例
 overlap_tracker = OverlapTracker(
-    enabled=True,
+    enabled=False,
 )
 
 _flag = False
