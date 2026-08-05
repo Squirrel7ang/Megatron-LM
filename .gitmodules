@@ -1,0 +1,3 @@
+[submodule "bitscom"]
+	path = bitscom
+	url = git@github.com:Squirrel7ang/bitscom.git

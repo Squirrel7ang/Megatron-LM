@@ -346,6 +346,55 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
+
+        # ---- bitscom: register lowbit backend and switch backend ----
+        if getattr(args, 'use_bitscom', False):
+            try:
+                import bitscom
+                bitscom.init(
+                    bitwidth=getattr(args, 'bitscom_bitwidth', 4),
+                    error_feedback=getattr(args, 'bitscom_error_feedback', False),
+                    error_feedback_mode=getattr(
+                        args, 'bitscom_error_feedback_mode', 'none',
+                    ),
+                    block_size=getattr(args, 'bitscom_block_size', 256),
+                    sparse_enabled=getattr(
+                        args, 'bitscom_sparse_enabled', False,
+                    ),
+                    sparse_projection_rank=getattr(
+                        args, 'bitscom_sparse_projection_rank', 4,
+                    ),
+                    sparse_compression_ratio=getattr(
+                        args, 'bitscom_sparse_compression_ratio', 0.1,
+                    ),
+                    sparse_priority_mode=getattr(
+                        args, 'bitscom_sparse_priority_mode', 0,
+                    ),
+                    sparse_priority_quantize_bitwidth=getattr(
+                        args, 'bitscom_sparse_priority_quantize_bitwidth', 4,
+                    ),
+                    sparse_non_priority_mode=getattr(
+                        args, 'bitscom_sparse_non_priority_mode', 1,
+                    ),
+                    sparse_non_priority_quantize_bitwidth=getattr(
+                        args, 'bitscom_sparse_non_priority_quantize_bitwidth', 4,
+                    ),
+                )
+                init_process_group_kwargs['backend'] = 'lowbit'
+                print_rank_0(
+                    'bitscom backend registered (bitwidth={}, sparse={})'.format(
+                        getattr(args, 'bitscom_bitwidth', 4),
+                        getattr(args, 'bitscom_sparse_enabled', False),
+                    )
+                )
+            except Exception as e:
+                print_rank_0(
+                    f'WARNING: bitscom initialization failed ({e}). '
+                    f'Falling back to NCCL backend. Gradient compression is DISABLED.'
+                )
+                # Ensure downstream code does not attempt the bitscom path.
+                args.use_bitscom = False
+
         if args.fake_process_group:
             assert is_torch_min_version("2.3.0"), "Fake process group is only supported with PyTorch 2.3.0 and above."
             from torch.testing._internal.distributed.fake_pg import FakeStore

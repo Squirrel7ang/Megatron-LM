@@ -169,6 +169,60 @@ class DistributedDataParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    # ---- bitscom: low-bit / sparse gradient compression ----
+    use_bitscom: bool = False
+    """If true, use bitscom for gradient all-reduce / reduce-scatter with optional
+       quantization and sparsification to reduce communication bandwidth."""
+
+    bitscom_bitwidth: int = 4
+    """Quantization bitwidth for bitscom gradient compression (1, 2, 4, 8, 12, 16).
+       Only used when use_bitscom=True. Values < 8 trigger the low-bit all2all+allgather
+       path; values >= 8 fall back to standard NCCL allreduce."""
+
+    bitscom_error_feedback: bool = False
+    """If true, enable error feedback (Stage 1 EF) in bitscom to compensate for
+       quantization errors over successive iterations. Uses legacy/memory mode."""
+
+    bitscom_error_feedback_mode: str = "none"
+    """Error feedback mode for bitscom: 'none', 'legacy' (memory), 'ef21', 'ef21_plus'.
+       'ef21_plus' additionally enables Stage 2 error feedback on the reduced shards."""
+
+    bitscom_block_size: int = 256
+    """Block size for block-wise quantization in bitscom."""
+
+    # ---- bitscom sparse ARC-Top-K ----
+    bitscom_sparse_enabled: bool = False
+    """If true, enable ARC-Top-K sparse communication in bitscom. The gradient tensor
+       is reshaped to a 2D matrix, priority rows are selected via random projection,
+       and only high-priority rows are communicated with full precision (or quantized),
+       while low-priority rows are quantized or discarded."""
+
+    bitscom_sparse_projection_rank: int = 4
+    """Projection rank for ARC-Top-K random projection in bitscom. The gradient matrix
+       G (n x m) is multiplied by a random matrix V (m x r) to obtain priority scores."""
+
+    bitscom_sparse_compression_ratio: float = 0.1
+    """Compression ratio for ARC-Top-K: fraction of rows selected as priority.
+       Range (0, 1]. Smaller values = more aggressive compression."""
+
+    bitscom_sparse_priority_mode: int = 0
+    """Communication mode for priority rows in bitscom sparse allreduce:
+       0 = kFull (full-precision NCCL allreduce)
+       1 = kQuantize (quantized communication, bitwidth set by priority_quantize_bitwidth)
+       2 = kDiscard (zero out, no communication)"""
+
+    bitscom_sparse_priority_quantize_bitwidth: int = 4
+    """Quantization bitwidth for priority rows when sparse_priority_mode=1 (kQuantize)."""
+
+    bitscom_sparse_non_priority_mode: int = 1
+    """Communication mode for non-priority rows in bitscom sparse allreduce:
+       0 = kFull (full-precision NCCL allreduce)
+       1 = kQuantize (quantized communication, bitwidth set by non_priority_quantize_bitwidth)
+       2 = kDiscard (zero out, no communication)"""
+
+    bitscom_sparse_non_priority_quantize_bitwidth: int = 4
+    """Quantization bitwidth for non-priority rows when sparse_non_priority_mode=1."""
+
     megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
     """Data type for the main weight buffer utilized for distributed optimization
       and quantization with Megatron-FSDP. If set to None, the model compute weight

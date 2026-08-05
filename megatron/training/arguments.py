@@ -2753,6 +2753,40 @@ def _add_distributed_args(parser):
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
+
+    # ---- bitscom: low-bit / sparse gradient compression ----
+    group.add_argument('--use-bitscom', action='store_true', default=False,
+                       help='If set, use bitscom for gradient all-reduce / reduce-scatter '
+                       'with optional quantization and sparsification.')
+    group.add_argument('--bitscom-bitwidth', type=int, default=4,
+                       choices=[1, 2, 4, 8, 12, 16],
+                       help='bitscom quantization bitwidth. Values < 8 trigger '
+                       'the low-bit all2all+allgather path.')
+    group.add_argument('--bitscom-error-feedback', action='store_true', default=False,
+                       help='If set, enable Stage-1 error feedback in bitscom.')
+    group.add_argument('--bitscom-error-feedback-mode', type=str, default='none',
+                       choices=['none', 'legacy', 'ef21', 'ef21_plus'],
+                       help='bitscom error feedback mode: none, legacy, ef21, ef21_plus.')
+    group.add_argument('--bitscom-block-size', type=int, default=256,
+                       help='Block size for block-wise quantization in bitscom.')
+    # bitscom sparse ARC-Top-K
+    group.add_argument('--bitscom-sparse-enabled', action='store_true', default=False,
+                       help='If set, enable ARC-Top-K sparse communication in bitscom.')
+    group.add_argument('--bitscom-sparse-projection-rank', type=int, default=4,
+                       help='Projection rank for ARC-Top-K random projection.')
+    group.add_argument('--bitscom-sparse-compression-ratio', type=float, default=0.1,
+                       help='Compression ratio for ARC-Top-K (0 to 1).')
+    group.add_argument('--bitscom-sparse-priority-mode', type=int, default=0,
+                       choices=[0, 1, 2],
+                       help='Communication mode for priority rows: 0=full, 1=quantize, 2=discard.')
+    group.add_argument('--bitscom-sparse-priority-quantize-bitwidth', type=int, default=4,
+                       help='Quantization bitwidth for priority rows when mode=1.')
+    group.add_argument('--bitscom-sparse-non-priority-mode', type=int, default=1,
+                       choices=[0, 1, 2],
+                       help='Communication mode for non-priority rows: 0=full, 1=quantize, 2=discard.')
+    group.add_argument('--bitscom-sparse-non-priority-quantize-bitwidth', type=int, default=4,
+                       help='Quantization bitwidth for non-priority rows when mode=1.')
+
     return parser
 
 

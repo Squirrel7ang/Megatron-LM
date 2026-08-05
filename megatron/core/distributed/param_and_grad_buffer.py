@@ -33,6 +33,12 @@ from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accu
 logger = logging.getLogger(__name__)
 
 try:
+    import bitscom  # noqa: F401 — availability check for bitscom backend
+    _HAS_BITSCOM = True
+except Exception:
+    _HAS_BITSCOM = False
+
+try:
     if is_torch_min_version("1.13.0"):
         dist_all_gather_func = torch.distributed.all_gather_into_tensor
         dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
@@ -65,6 +71,57 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
         buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
     ]
     return sharded_buffer
+
+
+# ============================================================================
+# bitscom: low-bit / sparse gradient communication wrappers
+# ============================================================================
+
+class _BitscomMultiWork:
+    """Wait on multiple bitscom async work handles (one per bucket group).
+
+    NCCL guarantees in-order completion on the same communicator.
+    We iterate and wait on each handle; the last handle is typically
+    the one that gates the full chain.
+    """
+
+    def __init__(self, handles):
+        self._handles = list(handles)
+
+    def wait(self):
+        for h in self._handles:
+            h.wait()
+        self._handles = None
+        return True
+
+
+def _bitscom_all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=None, async_op=False):
+    """All-reduce via bitscom C++ backend.
+
+    Delegates to ``dist.all_reduce`` on the lowbit process group, which
+    triggers ProcessGroupLowBit::allreduce internally.  Depending on the
+    bitscom init parameters this may use sparse ARC-Top-K, low-bit
+    quantized all-to-all / all-gather, or fall back to standard NCCL
+    allreduce.
+    """
+    return torch.distributed.all_reduce(
+        tensor, op=op, group=group, async_op=async_op,
+    )
+
+
+def _bitscom_reduce_scatter(output, input_tensor, op=torch.distributed.ReduceOp.SUM,
+                            group=None, async_op=False):
+    """Reduce-scatter via bitscom C++ backend.
+
+    Delegates to ``dist.reduce_scatter_tensor`` on the lowbit process
+    group, which triggers ProcessGroupLowBit::reduce_scatter internally.
+    Depending on the bitscom init parameters this may use sparse
+    ARC-Top-K reduce-scatter, low-bit quantized all-to-all, or fall back
+    to standard NCCL reduce-scatter.
+    """
+    return torch.distributed.reduce_scatter_tensor(
+        output, input_tensor, op=op, group=group, async_op=async_op,
+    )
 
 
 class _ParamAndGradBucket:
@@ -525,6 +582,10 @@ class _ParamAndGradBucketGroup:
         When ddp_config.overlap_grad_reduce is set to True, dispatches an asynchronous
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
+
+        When ddp_config.use_bitscom is True, gradient communication is routed through
+        the bitscom C++ backend (ProcessGroupLowBit), which automatically applies
+        sparsification and/or quantization depending on the bitscom init parameters.
         """
         if self.is_first_batch and self.grad_reduce_handle is not None:
             # Make this start_grad_sync call a no-op if in first batch and collective has
@@ -560,39 +621,146 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.average_in_collective:
             reduce_op = torch.distributed.ReduceOp.AVG
 
-        # We use the following stream synchronization for the gradient reduction
-        # within and across DistOpt instances.
-
-        # Compute Stream: -------------Gradient compute-------------------
-        # Comm. Stream:   ------(wait for NCCL)-----(wait for NCCL)-------
-        # NCCL Stream:          -------RS------     -------AR------
-
         # Use async communications only when overlap_grad_reduce is True.
         async_op = (
             self.ddp_config.overlap_grad_reduce
             and self.ddp_config.num_distributed_optimizer_instances == 1
         )
-        if (
-            self.ddp_config.num_distributed_optimizer_instances > 1
-            and self.ddp_config.overlap_grad_reduce
-        ):
-            # Assign a communication stream if we have multiple DistOpt instances and we
-            # need to overlap communication.
-            stream_context = torch.cuda.stream(self.communication_stream)
 
-            # The RS/AR communication stream needs to wait for the current stream
-            # to complete its gradient computation before launching the next
-            # gradient reduction collective.
-            self.communication_stream.wait_stream(torch.cuda.current_stream())
-        else:
+        # ------------------------------------------------------------------
+        # bitscom path: sparse / low-bit gradient communication
+        # ------------------------------------------------------------------
+        use_bitscom = (
+            _HAS_BITSCOM
+            and self.ddp_config.use_bitscom
+        )
+        if use_bitscom:
+            # bitscom always uses SUM internally.  When Megatron is configured
+            # to use AVG, pre-divide by the communication group size so the
+            # end-to-end result is still an average.
+            if reduce_op == torch.distributed.ReduceOp.AVG:
+                world_size = (
+                    self.intra_distributed_optimizer_instance_size
+                    if self.ddp_config.use_distributed_optimizer
+                    else self.data_parallel_group.size()
+                )
+                for bucket in self.buckets:
+                    bucket.grad_data /= world_size
+                reduce_op = torch.distributed.ReduceOp.SUM
+
+            # bitscom C++ backend handles its own stream synchronisation
+            # (records a CUDA event on the calling stream and waits on it
+            # inside the internal launcher stream), so we do NOT use a
+            # separate communication_stream or _coalescing_manager.
             stream_context = nullcontext()
+
+        else:
+            # ------------------------------------------------------------------
+            # Original path: standard NCCL with optional coalescing manager
+            # ------------------------------------------------------------------
+            if (
+                self.ddp_config.num_distributed_optimizer_instances > 1
+                and self.ddp_config.overlap_grad_reduce
+            ):
+                # Assign a communication stream if we have multiple DistOpt instances and we
+                # need to overlap communication.
+                stream_context = torch.cuda.stream(self.communication_stream)
+
+                # The RS/AR communication stream needs to wait for the current stream
+                # to complete its gradient computation before launching the next
+                # gradient reduction collective.
+                self.communication_stream.wait_stream(torch.cuda.current_stream())
+            else:
+                stream_context = nullcontext()
 
         if self.ddp_config.use_distributed_optimizer:
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
             communication_group = self.data_parallel_group
 
-        # Coalesce communication kernels across buckets in the bucket group.
+        if use_bitscom:
+            # ----- bitscom: per-bucket all-reduce / reduce-scatter (no coalescing) -----
+            grad_reduce_handle = None
+            bitscom_handles = []
+            with stream_context:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
+                        if self.cached_grad_buffer_shard_list[idx] is None:
+                            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                                bucket.grad_data,
+                                self.intra_distributed_optimizer_instance_size,
+                            )
+                        local_data_view = self.cached_grad_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        handle = _bitscom_reduce_scatter(
+                            local_data_view,
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
+                    else:
+                        if torch.distributed.get_rank() == 0 and force_all_reduce:
+                            logger.info(
+                                f"Performing reduction using bitscom all_reduce because "
+                                f"{force_all_reduce=}"
+                            )
+                        handle = _bitscom_all_reduce(
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
+                    if handle is not None:
+                        bitscom_handles.append(handle)
+
+            if async_op:
+                if bitscom_handles:
+                    self.grad_reduce_handle = _BitscomMultiWork(bitscom_handles)
+                else:
+                    self.grad_reduce_handle = None
+            else:
+                self.grad_reduce_handle = None
+
+            # ----- bitscom: inter-DistOpt-instance all-reduce -----
+            if (
+                self.ddp_config.use_distributed_optimizer
+                and self.ddp_config.num_distributed_optimizer_instances > 1
+            ):
+                assert self.inter_distributed_optimizer_instance_group is not None
+                inter_handles = []
+                with stream_context:
+                    for idx, bucket in enumerate(self.buckets):
+                        if self.cached_grad_buffer_shard_list[idx] is None:
+                            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                                bucket.grad_data,
+                                self.intra_distributed_optimizer_instance_size,
+                            )
+                        local_data_view = self.cached_grad_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        handle = _bitscom_all_reduce(
+                            local_data_view,
+                            op=reduce_op,
+                            group=self.inter_distributed_optimizer_instance_group,
+                            async_op=async_op,
+                        )
+                        if handle is not None:
+                            inter_handles.append(handle)
+
+                if async_op and inter_handles:
+                    # Merge inter-instance handles into the existing multi-work.
+                    all_handles = inter_handles
+                    if isinstance(self.grad_reduce_handle, _BitscomMultiWork):
+                        all_handles = self.grad_reduce_handle._handles + inter_handles
+                    self.grad_reduce_handle = _BitscomMultiWork(all_handles)
+
+            return  # bitscom path done — skip the standard coalescing path below
+
+        # ======================================================================
+        # Original path (non-bitscom): standard NCCL with coalescing manager
+        # ======================================================================
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
