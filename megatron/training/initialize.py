@@ -347,7 +347,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
 
-        # ---- bitscom: register lowbit backend and switch backend ----
+        # ---- bitscom: register lowbit backend (gradient-only lowbit process group) ----
+        # 默认进程组后端保持 NCCL；bitscom 只注册 "lowbit" 后端，
+        # 梯度同步专用的 lowbit 组在 initialize_model_parallel 中创建。
         if getattr(args, 'use_bitscom', False):
             try:
                 import bitscom
@@ -380,7 +382,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                         args, 'bitscom_sparse_non_priority_quantize_bitwidth', 4,
                     ),
                 )
-                init_process_group_kwargs['backend'] = 'lowbit'
                 print_rank_0(
                     'bitscom backend registered (bitwidth={}, sparse={})'.format(
                         getattr(args, 'bitscom_bitwidth', 4),
@@ -432,6 +433,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
                 create_all_gather_group=args.create_all_gather_group,
+                create_lowbit_process_groups=(
+                    args.use_bitscom and not args.fake_process_group
+                ),
             )
             print_rank_0(
                 f"> initialized tensor model parallel with size "

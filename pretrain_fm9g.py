@@ -15,7 +15,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.tensor_parallel import vocab_parallel_cross_entropy
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import (
@@ -244,7 +244,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     return train_ds, valid_ds, test_ds
 
 
-def model_provider(pre_process: bool, post_process: bool, vp_stage: int = None):
+def model_provider(pre_process: bool, post_process: bool, vp_stage: int = None, config=None, pg_collection=None):
     """
     Standard Megatron model provider. 
     In VP mode, Megatron calls this multiple times, once for each chunk.
@@ -252,7 +252,10 @@ def model_provider(pre_process: bool, post_process: bool, vp_stage: int = None):
     model = fm9g_builder(
         pre_process=pre_process, 
         post_process=post_process, 
-        vp_stage=vp_stage
+        vp_stage=vp_stage,
+        config=config,
+        # pg_collection=pg_collection
+        pg_collection=None
     )
 
     return model

@@ -137,6 +137,11 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
+# Lowbit (bitscom) twin of the intra distributed optimizer instance group.
+# Same ranks as _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP, but backed by the
+# bitscom "lowbit" backend. Used only for gradient synchronization.
+_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT = None
+
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
@@ -566,6 +571,7 @@ def initialize_model_parallel(
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
     create_all_gather_group: Optional[bool] = False,
+    create_lowbit_process_groups: bool = False,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
 ) -> None:
@@ -668,6 +674,11 @@ def initialize_model_parallel(
         create_gloo_process_groups (bool, default = True):
             Create Gloo process groups if set to True. If set to False, Gloo process groups are
             not created and calls to get Gloo process groups will result in assertion errors.
+
+        create_lowbit_process_groups (bool, default = False):
+            Create a lowbit (bitscom) twin of the intra distributed optimizer instance group,
+            backed by the bitscom "lowbit" backend, for gradient synchronization only.
+            Requires the lowbit backend to be registered via ``bitscom.init()`` beforehand.
 
         high_priority_stream_groups (List[str], default = None):
             Specify which communicator groups should use high priority streams during creation.
@@ -1334,6 +1345,10 @@ def initialize_model_parallel(
     assert (
         _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
     ), "Intra distributed optimizer instance group is already initialized"
+    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT
+    assert (
+        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT is None
+    ), "Lowbit intra distributed optimizer instance group is already initialized"
 
     model_parallel_group_id = 0
     intra_dist_opt_ranks = []
@@ -1349,6 +1364,23 @@ def initialize_model_parallel(
             )
             if rank in intra_dist_opt_ranks:
                 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+            if create_lowbit_process_groups:
+                # Lowbit (bitscom) twin of the intra dist-opt instance group, used
+                # only for gradient synchronization. Same ranks list (and thus the
+                # same group-local rank) as the NCCL twin, so shard indexing in
+                # param_and_grad_buffer matches. Every rank calls create_group at
+                # the same point to keep collective ordering consistent; the
+                # backend factory only runs on member ranks.
+                intra_dist_opt_instance_group_lowbit = create_group(
+                    intra_dist_opt_ranks,
+                    timeout=timeout,
+                    backend="lowbit",
+                    group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT",
+                )
+                if rank in intra_dist_opt_ranks:
+                    _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT = (
+                        intra_dist_opt_instance_group_lowbit
+                    )
             intra_dist_opt_ranks = []
 
     # Initialize global memory buffer
@@ -1993,6 +2025,19 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
+def get_intra_distributed_optimizer_instance_group_lowbit(check_initialized=True):
+    """Get the lowbit (bitscom) group of all GPUs in a distributed optimizer instance.
+
+    Same ranks as the NCCL intra distributed optimizer instance group, but backed
+    by the bitscom "lowbit" backend. Used only for gradient synchronization.
+    """
+    if check_initialized:
+        assert (
+            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT is not None
+        ), "Lowbit intra distributed optimizer instance group is not initialized"
+    return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT
+
+
 def get_inter_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group spanning the different distributed optimizer instances.
     Attention and MLP/Expert share same inter-instance group, so only built
@@ -2185,6 +2230,9 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT
+    _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP_LOWBIT = None
 
     global _global_process_group_list
     _global_process_group_list = None

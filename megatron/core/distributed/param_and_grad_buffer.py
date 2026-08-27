@@ -111,16 +111,31 @@ def _bitscom_all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=None, a
 
 def _bitscom_reduce_scatter(output, input_tensor, op=torch.distributed.ReduceOp.SUM,
                             group=None, async_op=False):
-    """Reduce-scatter via bitscom C++ backend.
+    """Reduce-scatter via bitscom C++ backend (vector form).
 
-    Delegates to ``dist.reduce_scatter_tensor`` on the lowbit process
+    Delegates to ``dist.reduce_scatter`` (vector form) on the lowbit process
     group, which triggers ProcessGroupLowBit::reduce_scatter internally.
     Depending on the bitscom init parameters this may use sparse
     ARC-Top-K reduce-scatter, low-bit quantized all-to-all, or fall back
     to standard NCCL reduce-scatter.
+
+    Note: the single-tensor ``dist.reduce_scatter_tensor`` routes through
+    ProcessGroupLowBit::_reduce_scatter_base, which is NOT implemented in the
+    bitscom C++ extension. The vector form hits the implemented
+    ProcessGroupLowBit::reduce_scatter override instead. ``input_tensor`` must
+    be flat and contiguous with numel divisible by the group size; chunk ``r``
+    is the slice destined for group-local rank ``r``.
     """
-    return torch.distributed.reduce_scatter_tensor(
-        output, input_tensor, op=op, group=group, async_op=async_op,
+    world_size = group.size() if group is not None else torch.distributed.get_world_size()
+    assert input_tensor.numel() % world_size == 0
+    shard_size = input_tensor.numel() // world_size
+    assert output.numel() == shard_size
+    input_list = [
+        input_tensor[(r * shard_size):((r + 1) * shard_size)]
+        for r in range(world_size)
+    ]
+    return torch.distributed.reduce_scatter(
+        output, input_list, op=op, group=group, async_op=async_op,
     )
 
 
@@ -680,6 +695,18 @@ class _ParamAndGradBucketGroup:
 
         if use_bitscom:
             # ----- bitscom: per-bucket all-reduce / reduce-scatter (no coalescing) -----
+            if self.ddp_config.use_distributed_optimizer:
+                # Route gradient communication through the dedicated lowbit group
+                # (same ranks as the NCCL intra dist-opt instance group, so shard
+                # indexing below is unchanged). Falls back to NCCL when the lowbit
+                # group was not created (e.g. pg_collection path).
+                lowbit_group = (
+                    parallel_state.get_intra_distributed_optimizer_instance_group_lowbit(
+                        check_initialized=False
+                    )
+                )
+                if lowbit_group is not None:
+                    communication_group = lowbit_group
             grad_reduce_handle = None
             bitscom_handles = []
             with stream_context:

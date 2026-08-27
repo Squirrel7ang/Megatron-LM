@@ -24,3 +24,11 @@ docs/apidocs
 
 # Git worktrees
 .worktrees/
+
+# Dataset
+data/**/raw
+data/**/processed
+log/*
+tensorboard/*
+**/debug_logs/*
+torch_profile/*
