@@ -324,6 +324,75 @@ class VocabParallelEmbedding(torch.nn.Module):
         }
 
 
+class LinearWithFrozenWeightPipelined(torch.autograd.Function):
+    """"""
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx,
+        input_,
+        weight,
+        bias,
+        allreduce_dgrad,
+        tp_group,
+        gather_input,
+    ):
+        """Forward with frozen weight with pipelined input gather"""
+        ctx.save_for_backward(weight)
+        ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.tp_group = tp_group
+        ctx.tensor_parallel_output_grad = True
+        ctx.group = tp_group
+        ctx.output_split_sizes = None
+        ctx.use_global_buffer = None
+
+
+        world_size = tp_group.size()
+        local_rank = torch.distributed.get_rank(group=tp_group)
+
+        if world_size == 1 or gather_input:
+            # TODO: do something simpler
+            output = input_.matmul(weight)
+            if bias is not None:
+                output = output.add(bias)
+            pass
+
+        results = []
+
+        # Stage 1: get the first input
+        broadcast_data = torch.zeros_like(input_)
+        current_input = torch.zeros_like(input_)
+        torch.distributed.broadcast(tensor=broadcast_data, src=0, group=tp_group, async_op=False)
+
+        # Stage 2: calculate while communicating
+        for rank in range(1, world_size):
+            if work is not None:
+                work.wait()
+            current_input = broadcast_data
+            work = torch.distributed.broadcast(tensor=broadcast_data, src=rank, group=tp_group, async_op=True)
+            result = current_input.matmul(weight)
+            results.append(result)
+            
+        # Stage 3: calculate the last input
+        current_input = broadcast_data
+        result = current_input.matmul(weight)
+        results.append(result)
+
+        output = torch.cat(results, dim=0)
+        if bias is not None:
+            output = output.add(bias)
+
+        return output
+        
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        #TODO
+        pass
+        
+
+
 class LinearWithFrozenWeight(torch.autograd.Function):
     """Linear operator that does not calculate gradient for weight.
     This op and LinearWithGradAccumulationAndAsyncCommunication performs
